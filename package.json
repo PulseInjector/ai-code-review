@@ -1,0 +1,23 @@
+{
+  "name": "ai-code-review",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "engines": {
+    "bun": "1.4.4"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "smoke:sdk": "bun run src/smoke/sdk-lifecycle.ts",
+    "smoke:model": "bun run src/smoke/sdk-model.ts",
+    "smoke:java": "bun run src/smoke/java-toolchain.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.7",
+    "@opencode/sdk": "2.2.7"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2"
+  }
+}
