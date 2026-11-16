@@ -4,6 +4,8 @@ This guide covers changes made from a source checkout. Environment setup and mod
 
 ## Start a Change
 
+If `.local/project-context.md` exists, read it for local project context before starting a task. Keep private links and notes out of commits and shared PR descriptions.
+
 Check the working tree before starting. Keep each branch to one logical change and create it from `main`. Use a short, descriptive lowercase name with a prefix such as `feat/`, `fix/`, `docs/`, or `chore/` (for example, `docs/development-workflow`).
 
 ## Make and Check the Change
