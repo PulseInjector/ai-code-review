@@ -6,7 +6,7 @@ This guide covers changes made from a source checkout. Environment setup and mod
 
 If `.local/project-context.md` exists, read it for local project context before starting a task. Keep private links and notes out of commits and shared PR descriptions.
 
-Check the working tree before starting. Keep each branch to one logical change and create it from `main`. Use a short, descriptive lowercase name with a prefix such as `feat/`, `fix/`, `docs/`, or `chore/` (for example, `docs/development-workflow`).
+Check the working tree before starting. Keep each branch to one logical change. For a standalone change, create the task branch from `main`. For a feature delivered through multiple PRs, create an integration branch from `main` and create each internal task branch from the latest integration branch. Use a short, descriptive lowercase name with a prefix such as `feat/`, `fix/`, `docs/`, or `chore/` (for example, `docs/development-workflow`).
 
 ## Make and Check the Change
 
@@ -21,6 +21,6 @@ Review the diff before committing. Stage only files belonging to the change, kee
 
 ## Share and Review
 
-When a remote is available, push the task branch and open a pull request against `main`. Use the PR template to explain why the change is needed, what changed, and which checks actually ran. Keep the PR to one logical change.
+When a remote is available, push the task branch and open a pull request against its integration branch, or against `main` for a standalone change. Use the PR template to explain why the change is needed, what changed, and which checks actually ran. Keep the PR to one logical change.
 
-Address review feedback on the same branch, rerun checks affected by the revisions, and update the PR description when its account of the change becomes inaccurate. Merge after review and applicable checks are complete.
+Address review feedback on the same branch, rerun checks affected by the revisions, and update the PR description when its account of the change becomes inaccurate. Merge each internal PR into the integration branch after review and applicable checks are complete. Run the feature's end-to-end acceptance on the integration branch, then open its PR to `main`. Merge that PR only after the feature acceptance, review, and applicable checks are complete.
