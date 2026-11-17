@@ -1,0 +1,27 @@
+diff --git a/src/example/OrderService.java b/src/example/OrderService.java
+--- a/src/example/OrderService.java
++++ b/src/example/OrderService.java
+@@ -8,6 +8,6 @@ public final class OrderService {
+   public List<String> itemIds(String customerId) {
+     if (!orders.containsKey(customerId)) {
+-      return List.of();
++      return null;
+     }
+     return orders.get(customerId);
+   }
+diff --git a/src/example/OrderSummary.java b/src/example/OrderSummary.java
+--- a/src/example/OrderSummary.java
++++ b/src/example/OrderSummary.java
+@@ -6,7 +6,10 @@ public final class OrderSummary {
+   public int itemCount(String customerId) {
+     int count = 0;
+-    for (String ignored : service.itemIds(customerId)) {
+-      count++;
++    var items = service.itemIds(customerId);
++    if (items != null) {
++      for (String ignored : items) {
++        count++;
++      }
+     }
+     return count;
+   }
