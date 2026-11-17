@@ -1,0 +1,5 @@
+{
+  "maxChangedFiles": 50,
+  "maxPatchBytes": 262144,
+  "maxSnapshotBytes": 8388608
+}
