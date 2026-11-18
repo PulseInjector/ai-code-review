@@ -9,7 +9,7 @@
   "scripts": {
     "review": "bun run src/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test src/contracts.test.ts src/fixtures/java-review.test.ts src/context.test.ts",
+    "test": "bun test src/contracts.test.ts src/fixtures/java-review.test.ts src/context.test.ts src/runtime/runtime.test.ts",
     "smoke:sdk": "bun run src/smoke/sdk-lifecycle.ts",
     "smoke:model": "bun run src/smoke/sdk-model.ts",
     "smoke:java": "bun run src/smoke/java-toolchain.ts"
