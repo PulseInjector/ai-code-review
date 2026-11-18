@@ -17,7 +17,7 @@ function git(args: string[]) {
   return decoder.decode(result.stdout).trim()
 }
 
-async function review(name: string, base: string, head: string) {
+async function review(name: string, base: string, head: string, options: { allowFailed?: boolean } = {}) {
   const out = join(root, name)
   const started = Date.now()
   const child = Bun.spawnSync(["bun", "run", "review", "--", "--repo", repo, "--base", base, "--head", head, "--out", out], {
@@ -30,7 +30,9 @@ async function review(name: string, base: string, head: string) {
   try { raw = JSON.parse(stdout) } catch { throw new Error(`${name} returned no result JSON: ${stderr || stdout}`) }
   const result = z.object({ runDirectory: z.string(), result: reviewResultSchema }).parse(raw)
   const report = await readFile(join(out, "report.md"), "utf8")
-  if (result.result.status === "failed") throw new Error(`${name} failed: ${result.result.stageErrors[0]?.message ?? stderr}`)
+  if (result.result.status === "failed" && !options.allowFailed) {
+    throw new Error(`${name} failed: ${result.result.stageErrors[0]?.message ?? stderr}`)
+  }
   assert.ok(Date.now() - started < 300_000, "review exceeded its whole-run budget")
   const runtime = runtimeResultSchema.parse(JSON.parse(await readFile(join(out, "runtime/result.json"), "utf8")))
   assert.equal(runtime.status, "complete")
@@ -51,7 +53,7 @@ async function review(name: string, base: string, head: string) {
     const text = await readFile(join(file.parentPath, file.name), "utf8")
     if (process.env.REVIEW_MODEL_API_KEY) assert.ok(!text.includes(process.env.REVIEW_MODEL_API_KEY), "configured credential must not appear in run artifacts")
   }
-  return { code: child.exitCode, out, result: result.result, report }
+  return { code: child.exitCode, out, result: result.result, report, runtime }
 }
 
 try {
@@ -73,10 +75,26 @@ try {
   git(["-c", "user.name=Review Acceptance", "-c", "user.email=acceptance@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "test oversized supporting caller"])
   const incompleteBase = git(["rev-parse", "HEAD"])
   git(["-c", "user.name=Review Acceptance", "-c", "user.email=acceptance@example.invalid", "-c", "commit.gpgsign=false", "cherry-pick", commits.defectSha])
-  const incomplete = await review("incomplete", incompleteBase, git(["rev-parse", "HEAD"]))
-  assert.equal(incomplete.code, 0)
-  assert.equal(incomplete.result.status, "partial")
-  assert.ok(incomplete.result.coverage.omittedPaths.includes("src/example/OrderSummary.java"))
+  const incomplete = await review("incomplete", incompleteBase, git(["rev-parse", "HEAD"]), { allowFailed: true })
+  const omittedCaller = "src/example/OrderSummary.java"
+  assert.ok(["partial", "failed"].includes(incomplete.result.status))
+  assert.ok(incomplete.result.coverage.omittedPaths.includes(omittedCaller))
+  assert.ok(incomplete.report.includes(omittedCaller), "report must name the omitted supporting file")
+  if (incomplete.result.status === "partial") {
+    assert.equal(incomplete.code, 0)
+    assert.equal(incomplete.result.stageErrors.length, 0)
+    assert.ok(incomplete.report.includes("Status: **partial**"), "report must not present partial coverage as complete")
+  } else {
+    assert.equal(incomplete.code, 1)
+    assert.equal(incomplete.result.issues.length, 0, "failed review must not publish findings")
+    assert.ok(incomplete.result.stageErrors.length > 0, "failed review must explain the failure")
+    for (const error of incomplete.result.stageErrors) {
+      assert.ok(incomplete.report.includes(error.message), "report must include each failure reason")
+    }
+    assert.ok(incomplete.report.includes("Status: **failed**"), "report must identify the failed review")
+    assert.equal(incomplete.runtime.cleanup.hostClosed, true, "failed review worker host must be closed")
+    assert.equal(incomplete.runtime.cleanup.forced, false, "failed review worker must not require forced shutdown")
+  }
 
   const summary = {
     defect: { status: defect.result.status, findings: defect.result.issues.length, report: join(defect.out, "report.md") },
