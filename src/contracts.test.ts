@@ -18,6 +18,7 @@ test("parses the minimal review contracts", () => {
   expect(parseCandidate(candidate).id).toBe("C-1")
   expect(parseVerification(verification).decision).toBe("keep")
   expect(parseReviewResult({
+    runId: "run-1",
     snapshot,
     status: "complete",
     issues: [{ candidate, verification }],
@@ -25,6 +26,7 @@ test("parses the minimal review contracts", () => {
     stageErrors: [],
     usage: { kind: "known", inputTokens: 10, outputTokens: 20 },
     versions: { program: "0.1", sdk: "2.2.7", config: "v1", discoverPrompt: "v1", verifyPrompt: "v1" },
+    durationMs: 25,
   }).issues).toHaveLength(1)
 })
 
@@ -57,6 +59,7 @@ test("verification output has unique candidate IDs and a fixed limit", () => {
 
 test("rejects published issues without a matching keep decision", () => {
   const result = {
+    runId: "run-1",
     snapshot: { baseSha: sha, headSha: sha, mergeBaseSha: sha },
     status: "complete",
     issues: [{ candidate, verification: { ...verification, candidateId: "C-2" } }],
@@ -64,6 +67,7 @@ test("rejects published issues without a matching keep decision", () => {
     stageErrors: [],
     usage: { kind: "unknown", reason: "session interrupted" },
     versions: { program: "0.1", sdk: "2.2.7", config: "v1", discoverPrompt: "v1", verifyPrompt: "v1" },
+    durationMs: 0,
   }
   expect(() => parseReviewResult(result)).toThrow()
   expect(() => parseReviewResult({

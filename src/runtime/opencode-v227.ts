@@ -2,8 +2,17 @@ import { OpenCode } from "@opencode/sdk"
 import type { SessionMessageInfo } from "@opencode/client"
 import { createContextLimitsPlugin } from "./context-limits"
 import { emptyReadBudget, sumUsage, unknownUsage, type PhaseResult, type RuntimeResult, type WorkerInput } from "./contracts"
+import { validateDiscoveryText, validateVerificationText } from "../phase-validation"
+import type { Candidate } from "../contracts"
 
 export type RuntimeHost = Pick<OpenCode.Interface, "sessions" | "message" | "events" | "model" | "close">
+export function resolvePhasePrompt(prompt: string, previousOutput?: string): string {
+  const marker = "{{PREVIOUS_PHASE_OUTPUT}}"
+  if (!prompt.includes(marker)) return prompt
+  if (previousOutput === undefined) throw new Error("phase prompt requires output from a preceding phase")
+  return prompt.replace(marker, () => previousOutput)
+}
+
 export const readOnlyPermissions = () => [
   { action: "*", resource: "*", effect: "deny" as const },
   { action: "read", resource: "*", effect: "allow" as const },
@@ -95,15 +104,14 @@ async function runSession(options: {
         return { name: prompt.name, sessionID, status: "complete", text, usage }
       }
       // After interruption continue reading the durable terminal message until the parent deadline.
-      const timer = setTimeout(() => {}, 1000)
+      let timer: ReturnType<typeof setTimeout> | undefined
       try {
         const event = await Promise.race([...(streamOpen ? [nextEvent] : []), new Promise<undefined>((resolve) => {
-          clearTimeout(timer)
-          setTimeout(() => resolve(undefined), 1000)
+          timer = setTimeout(() => resolve(undefined), 1000)
         })])
         if (event?.done) streamOpen = false
         else if (event) nextEvent = iterator.next().catch(() => undefined)
-      } finally { clearTimeout(timer) }
+      } finally { if (timer) clearTimeout(timer) }
     }
   } finally {
     signal.removeEventListener("abort", onAbort)
@@ -125,6 +133,7 @@ export async function runRuntime(input: WorkerInput, signal: AbortSignal, onProg
   const progress = (): RuntimeResult => ({ status: "interrupted", error: "runtime is in progress", sessions, usage: unknownUsage("active session usage is not settled"), readBudget: budget, cleanup })
   let host: OpenCode.Interface | undefined
   let outcome: RuntimeResult | undefined
+  let phaseActive = false
   try {
     host = await OpenCode.create({
       config: {
@@ -141,25 +150,38 @@ export async function runRuntime(input: WorkerInput, signal: AbortSignal, onProg
     })
     const models = await host.model.list({ location: { directory: input.materialDirectory }, types: ["chat"] })
     if (!models.data.some((model) => model.enabled && model.providerID === input.model.providerID && model.id === input.model.modelID)) throw new Error("configured model is not enabled in the isolated runtime")
+    let previousOutput: string | undefined
+    let discovered: Candidate[] | undefined
     for (const prompt of input.prompts) {
       if (controller.signal.aborted || Date.now() >= input.deadline) break
-      const result = await runSession({ host, input, prompt, signal: controller.signal, stopped: () => stopped })
+      if (prompt.name === "verify" && input.phaseValidation && !discovered) throw new Error("verification requires a validated discovery result")
+      const text = resolvePhasePrompt(prompt.text, previousOutput)
+      const phaseStarted = Date.now()
+      phaseActive = true
+      const result = { ...await runSession({ host, input, prompt: { ...prompt, text }, signal: controller.signal, stopped: () => stopped }), durationMs: Date.now() - phaseStarted }
+      phaseActive = false
       sessions.push(result)
       onProgress(progress())
       if (result.status !== "complete") break
+      previousOutput = result.text
+      if (input.phaseValidation && prompt.name === "discover") {
+        discovered = await validateDiscoveryText(result.text, input.phaseValidation, input.materialDirectory)
+      } else if (input.phaseValidation && prompt.name === "verify") {
+        await validateVerificationText(result.text, discovered ?? [], input.phaseValidation, input.materialDirectory)
+      }
     }
     const failed = sessions.find((session) => session.status !== "complete")
     if (failed) outcome = { status: failed.status, error: failed.error, sessions, usage: sumUsage(sessions), readBudget: budget, cleanup }
     else if (sessions.length !== input.prompts.length) outcome = { status: stopped, error: "runtime stopped before all sessions completed", sessions, usage: unknownUsage("remaining sessions were not run"), readBudget: budget, cleanup }
     else outcome = { status: "complete", sessions, usage: sumUsage(sessions), readBudget: budget, cleanup }
   } catch (error) {
-    outcome = { status: "failed", error: error instanceof Error ? error.message : String(error), sessions, usage: unknownUsage("runtime failed before usage settled"), readBudget: budget, cleanup }
+    outcome = { status: "failed", error: error instanceof Error ? error.message : String(error), sessions, usage: !phaseActive && sessions.length ? sumUsage(sessions) : unknownUsage("runtime failed before usage settled"), readBudget: budget, cleanup }
   } finally {
     signal.removeEventListener("abort", forwardAbort)
     try {
       if (host) { await host.close(); cleanup.hostClosed = true }
     } catch {
-      outcome = { status: "failed", error: "SDK host cleanup failed", sessions, usage: unknownUsage("cleanup failed"), readBudget: budget, cleanup }
+      outcome = { status: "failed", error: "SDK host cleanup failed", sessions, usage: outcome?.usage ?? unknownUsage("cleanup failed"), readBudget: budget, cleanup }
     }
   }
   return outcome

@@ -16,6 +16,7 @@ Keep code, tests, and documentation consistent with the behavior changed. Run th
 - `bun run smoke:sdk` for changes affecting SDK host startup or shutdown.
 - `bun run smoke:java` for changes affecting the Java toolchain.
 - `bun run smoke:model` for changes affecting model configuration or SDK model requests. This makes a live API call and requires the configuration described in [ENVIRONMENT.md](ENVIRONMENT.md#model-connection).
+- `bun run smoke:review` for the complete local review command and report. This makes three live model runs and checks defect, guarded, and partial-coverage cases.
 
 Review the diff before committing. Stage only files belonging to the change and write a message that states the result clearly. At each checkpoint, run its relevant checks and record the results for the final PR. Do not commit `.env.local` or credentials.
 

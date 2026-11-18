@@ -78,10 +78,12 @@ test("prepares fixed Git snapshots with rename, deletion, and excluded inputs", 
 
     const command = Bun.spawnSync(["bun", "run", "review", "--", "--repo", repo, "--base", base, "--head", head, "--out", join(root, "cli")], {
       cwd: join(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe",
+      env: { ...process.env, REVIEW_MODEL_API_KEY: "" },
     })
-    expect(command.exitCode).toBe(0)
-    expect(JSON.parse(new TextDecoder().decode(command.stdout)).stage).toBe("preparation")
+    expect(command.exitCode).toBe(1)
+    expect(JSON.parse(new TextDecoder().decode(command.stdout)).result.status).toBe("failed")
     expect(JSON.parse(await readFile(join(root, "cli/manifest.json"), "utf-8")).snapshot.headSha).toBe(head)
+    expect(await readFile(join(root, "cli/report.md"), "utf-8")).toContain("failed")
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -115,6 +117,32 @@ test("records changed-file, patch, and snapshot limits as partial coverage", asy
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test("oversized supporting files remain visible in partial coverage", async () => {
+  const { root, repo } = await repository()
+  try {
+    await writeFile(join(repo, "changed.txt"), "old\n")
+    await writeFile(join(repo, "caller.txt"), "x".repeat(101))
+    const base = commit(repo, "base")
+    await writeFile(join(repo, "changed.txt"), "new\n")
+    const head = commit(repo, "head")
+    const manifest = await prepareContext({ repo, base, head, out: join(root, "run") }, {
+      maxChangedFiles: 50, maxPatchBytes: 262144, maxSnapshotBytes: 100,
+    })
+    expect(manifest.changes[0]?.included).toBe(true)
+    expect(manifest.status).toBe("partial")
+    expect(manifest.coverage.omittedPaths).toEqual(["caller.txt"])
+    expect(manifest.files.filter(({ path }) => path === "caller.txt").every(({ reason }) => reason === "snapshot-limit")).toBe(true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test("preparation refuses Git work after the shared deadline", async () => {
+  const { root, repo } = await repository()
+  try {
+    await expect(prepareContext({ repo, base: "HEAD", head: "HEAD", out: join(root, "late") }, undefined, Date.now() - 1))
+      .rejects.toThrow("deadline")
+  } finally { await rm(root, { recursive: true, force: true }) }
 })
 
 test("uses the merge base for changes and the selected base for review instructions", async () => {

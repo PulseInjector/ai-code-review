@@ -87,8 +87,9 @@ const verifiedIssueSchema = z.strictObject({
 
 const coverageSchema = z.strictObject({
   includedPaths: z.array(relativePathSchema),
-  omittedPaths: z.array(relativePathSchema),
+  omittedPaths: z.array(z.string().min(1)),
   unverifiedCandidateIds: z.array(identifierSchema),
+  unpublishedCandidateIds: z.array(identifierSchema).default([]),
   notes: z.array(textSchema),
 })
 
@@ -111,6 +112,7 @@ const usageSchema = z.discriminatedUnion("kind", [
 ])
 
 export const reviewResultSchema = z.strictObject({
+  runId: identifierSchema,
   snapshot: snapshotSchema,
   status: z.enum(["complete", "partial", "failed", "skipped"]),
   issues: z.array(verifiedIssueSchema).max(5),
@@ -124,9 +126,11 @@ export const reviewResultSchema = z.strictObject({
     discoverPrompt: textSchema,
     verifyPrompt: textSchema,
   }),
+  durationMs: z.int().nonnegative(),
 }).refine((result) => result.status !== "complete" || (
   result.coverage.omittedPaths.length === 0 &&
   result.coverage.unverifiedCandidateIds.length === 0 &&
+  result.coverage.unpublishedCandidateIds.length === 0 &&
   result.stageErrors.length === 0
 ), {
   message: "complete results cannot have uncovered work or stage errors",

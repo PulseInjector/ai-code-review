@@ -16,6 +16,10 @@ export const modelSchema = z.strictObject({
   modelID: z.string().trim().min(1).max(256),
 })
 export const promptSchema = z.strictObject({ name: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/u), text: z.string().min(1).max(256 * 1024) })
+export const phaseValidationSchema = z.strictObject({
+  changedHeadPaths: z.array(z.string().min(1)),
+  includedFiles: z.array(z.strictObject({ side: z.enum(["merge-base", "head"]), path: z.string().min(1) })),
+})
 export const workerInputSchema = z.strictObject({
   model: modelSchema,
   materialDirectory: absolutePath,
@@ -23,6 +27,7 @@ export const workerInputSchema = z.strictObject({
   deadline: z.int().positive(),
   readLimits: readLimitsSchema,
   prompts: z.array(promptSchema).min(1).max(2),
+  phaseValidation: phaseValidationSchema.optional(),
 })
 export const usageSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("known"), inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative() }),
@@ -38,7 +43,7 @@ export const readBudgetSchema = z.strictObject({
   consumedBytes: z.int().nonnegative(), truncated: z.boolean(), exhausted: z.boolean(),
   records: z.array(readRecordSchema),
 })
-const phaseCommon = { name: z.string(), sessionID: z.string().optional(), usage: usageSchema }
+const phaseCommon = { name: z.string(), sessionID: z.string().optional(), usage: usageSchema, durationMs: z.int().nonnegative().optional() }
 export const phaseResultSchema = z.discriminatedUnion("status", [
   z.strictObject({ ...phaseCommon, status: z.literal("complete"), text: z.string().min(1).max(256 * 1024) }),
   z.strictObject({ ...phaseCommon, status: z.enum(["failed", "interrupted", "timeout", "read-budget-exhausted"]), error: z.string().min(1) }),
@@ -57,6 +62,7 @@ export type ReadRecord = z.infer<typeof readRecordSchema>
 export type ReadBudget = z.infer<typeof readBudgetSchema>
 export type ModelConfiguration = z.infer<typeof modelSchema>
 export type WorkerInput = z.infer<typeof workerInputSchema>
+export type PhaseValidation = z.infer<typeof phaseValidationSchema>
 export type RuntimeResult = z.infer<typeof runtimeResultSchema>
 export type PhaseResult = z.infer<typeof phaseResultSchema>
 export type Usage = z.infer<typeof usageSchema>

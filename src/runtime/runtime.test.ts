@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { applyReadBudget, clampReadLimit } from "./context-limits"
 import { emptyReadBudget, defaultReadLimits, workerInputSchema } from "./contracts"
-import { completedTurn, listMessages, readOnlyPermissions, type RuntimeHost } from "./opencode-v227"
+import { completedTurn, listMessages, readOnlyPermissions, resolvePhasePrompt, type RuntimeHost } from "./opencode-v227"
 import { buildWorkerEnvironment, loadModelConfiguration, serializeWorkerInput, type WorkerOptions } from "./worker-process"
 import type { SessionMessageInfo } from "@opencode/client"
 
@@ -76,5 +76,14 @@ describe("controlled model runtime", () => {
     expect(messages).toEqual([user, assistant, idle])
     expect(calls).toEqual([{ sessionID: "session", order: "asc" }, { sessionID: "session", cursor: "page-2" }])
     expect(completedTurn(messages, "input")?.idle.outcome).toBe("succeeded")
+  })
+
+  test("injects only the preceding phase output into a dependent prompt", () => {
+    const prompt = "Verify this result: {{PREVIOUS_PHASE_OUTPUT}}"
+    expect(resolvePhasePrompt(prompt, '{"candidates":[]}')).toBe('Verify this result: {"candidates":[]}')
+    const literal = '{"rootCause":"$& $` $\u0027 {{PREVIOUS_PHASE_OUTPUT}}"}'
+    expect(resolvePhasePrompt(`${prompt}\nPath: {{PREVIOUS_PHASE_OUTPUT}}`, literal)).toBe(`Verify this result: ${literal}\nPath: {{PREVIOUS_PHASE_OUTPUT}}`)
+    expect(() => resolvePhasePrompt(prompt)).toThrow("preceding phase")
+    expect(resolvePhasePrompt("Independent prompt")).toBe("Independent prompt")
   })
 })

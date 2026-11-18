@@ -39,16 +39,32 @@ Copy `.env.example` to `.env.local` and set all four fields:
 bun run smoke:model
 ```
 
+`bun run smoke:review` runs three full live reviews against the Java defect, guarded, and incomplete-material cases. The incomplete case makes the supporting caller exceed the snapshot limit. Successful and failed run artifacts remain under the printed temporary directory for inspection. Choose an output location without an ancestor `AGENTS.md`, so SDK tools cannot load ambient instructions.
+
 This check creates an SDK session using the configured provider and model, waits for an assistant reply, and closes the host. It runs in an isolated child process so it does not read the host's existing OpenCode configuration. The check uses the OpenAI-compatible provider adapter, so the endpoint must support that protocol. Other provider protocols are outside this check's current support.
 
 ## Local Review Preparation
 
-The current `review` command prepares fixed Git material. It does not start a model or produce review findings yet:
+The `review` command prepares fixed Git material, runs discovery and independent verification, then writes a JSON result, Markdown report, coverage, phase outputs, tool trace, timing, and usage to the requested new run directory:
 
 ```sh
 bun run review -- --repo /path/to/repo --base <revision> --head <revision> --out /path/to/new-run-directory
 ```
 
-The output directory must be new, with an existing parent outside the target repository. The command resolves both revisions and their merge base to commit SHAs, writes `manifest.json`, and places text snapshots and numbered per-change patches under `material/`. `manifest.json` records every tracked file, rename and deletion status, included paths, omitted paths and reasons, and the preparation status. The initial limits in `review.config.json` are 50 changed text files, 256 KiB of patches, and 8 MiB of snapshot text. Excluded files and exhausted limits are recorded; an omitted changed file or size-limited supporting file makes the preparation status `partial`.
+The output directory must be new, with an existing parent outside the target repository. The command resolves both revisions and their merge base to commit SHAs, writes `manifest.json`, and places text snapshots and numbered per-change patches under `material/`. The JSON result records verified issues, coverage, stage errors, usage, duration, and configuration and prompt hashes. `report.md` summarizes findings with fixed-snapshot code evidence. `manifest.json` records every tracked file, rename and deletion status, included paths, omitted paths and reasons, and the preparation status. The initial limits in `review.config.json` are 50 changed text files, 256 KiB of patches, and 8 MiB of snapshot text. Excluded files and exhausted limits are recorded; an omitted changed file or size-limited supporting file makes the preparation status `partial`.
 
 The source checkout is never used as the material directory. `REVIEW.md`, when present, is read from the fixed base commit as an explicitly sourced instruction in the manifest. Target `AGENTS.md`, runtime configuration directories, secrets, binary files, and symbolic links are not copied into searchable material.
+
+Run artifacts include:
+
+| File | Contents |
+| --- | --- |
+| `result.json`, `report.md` | Final status, at most five verified issues, code evidence, coverage, duration, usage, and version hashes. |
+| `manifest.json`, `input.json`, `material/` | Fixed commits, input inventory, inclusion/omission reasons, text snapshots, and patches. |
+| `configuration.json`, `prompts.json`, `versions.json` | Non-secret model/settings, rendered discovery prompt and verification template, and source/config/prompt hashes. The verification template's marker is replaced with the discovery session's final JSON. |
+| `candidates.json`, `verifications.json`, `sessions.json` | Structured decisions and raw final phase text, including invalid output retained on failure. |
+| `coverage.json`, `tool-trace.json`, `timing.json`, `usage.json`, `cleanup.json` | Unfinished work, tool reads and pending pages, phase timing, settled or unknown token usage, and host shutdown. |
+
+The 300-second budget covers preparation, worker initialization, both sessions, cleanup, and reporting. Git commands share the remaining deadline; the parent interrupts the worker before its deadline and kills its process group if needed. Credential files and the worker's temporary HOME are removed when it exits.
+
+The command writes one JSON summary to stdout. Exit code `0` means `complete`, `partial`, or `skipped`; findings do not make this advisory tool fail. Exit code `1` means a failed review or invalid command. Inspect `result.status` and coverage before interpreting zero findings. With no changed files it skips model calls. If all changed files are omitted, it reports `partial` without starting a model. Invalid input or snapshot preparation fails before a run directory is published; errors after preparation retain a failure report and available replay records.

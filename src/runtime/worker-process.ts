@@ -10,6 +10,7 @@ const workerOptionsSchema = workerInputSchema.omit({ configDirectory: true, dead
   runDirectory: z.string().min(1), apiKey: z.string().trim().min(1),
   timeoutMs: z.int().min(500).max(RUNTIME_TIMEOUT_MS).default(RUNTIME_TIMEOUT_MS),
   cleanupGraceMs: z.int().min(100).max(10_000).default(10_000),
+  deadline: z.int().positive().optional(),
   readLimits: workerInputSchema.shape.readLimits.default(defaultReadLimits),
 }).refine((input) => input.cleanupGraceMs < input.timeoutMs, "cleanup grace must fit inside the run budget")
 export type WorkerOptions = z.input<typeof workerOptionsSchema>
@@ -44,7 +45,7 @@ async function readResult(path: string): Promise<RuntimeResult | undefined> {
 export async function runIsolatedWorker(rawOptions: WorkerOptions): Promise<RuntimeResult> {
   const started = Date.now()
   const options = workerOptionsSchema.parse(rawOptions)
-  const deadline = started + options.timeoutMs
+  const deadline = Math.min(started + options.timeoutMs, options.deadline ?? Infinity)
   await assertCleanSystemConfig()
   const materialDirectory = await validateMaterialDirectory(options.materialDirectory)
   const directory = await realpath(options.runDirectory)

@@ -1,4 +1,5 @@
-import { prepareContext, type ReviewInput } from "./context"
+import type { ReviewInput } from "./context"
+import { runReview } from "./review"
 
 export function parseReviewInput(argv: string[]): ReviewInput {
   const args = argv[0] === "--" ? argv.slice(1) : argv
@@ -24,8 +25,9 @@ if (import.meta.main) {
     process.exit(0)
   }
   try {
-    const manifest = await prepareContext(parseReviewInput(process.argv.slice(2)))
-    console.log(JSON.stringify({ stage: "preparation", status: manifest.status, snapshot: manifest.snapshot, coverage: manifest.coverage }))
+    const run = await runReview(parseReviewInput(process.argv.slice(2)))
+    console.log(JSON.stringify({ runDirectory: run.runDirectory, result: run.artifacts.result }))
+    if (run.artifacts.result.status === "failed") process.exitCode = 1
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error))
     process.exitCode = 1
