@@ -7,14 +7,18 @@
     "bun": "1.4.4"
   },
   "scripts": {
+    "review": "bun run src/cli.ts",
     "typecheck": "tsc --noEmit",
+    "test": "bun test src/contracts.test.ts src/fixtures/java-review.test.ts src/context.test.ts src/discovery.test.ts src/report.test.ts src/review.test.ts src/runtime/runtime.test.ts src/runtime/worker-process.test.ts",
     "smoke:sdk": "bun run src/smoke/sdk-lifecycle.ts",
     "smoke:model": "bun run src/smoke/sdk-model.ts",
+    "smoke:review": "bun run src/smoke/review-acceptance.ts",
     "smoke:java": "bun run src/smoke/java-toolchain.ts"
   },
   "dependencies": {
     "@opencode/plugin": "2.2.7",
-    "@opencode/sdk": "2.2.7"
+    "@opencode/sdk": "2.2.7",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/bun": "1.4.4",

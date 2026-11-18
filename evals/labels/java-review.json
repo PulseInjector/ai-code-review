@@ -1,0 +1,16 @@
+{
+  "defect": {
+    "expected": "defect",
+    "rootCause": "OrderService returns null for a missing customer while OrderSummary iterates without a null check",
+    "trigger": "itemCount is called for a customer without orders",
+    "consequence": "NullPointerException instead of a count of zero"
+  },
+  "guarded": {
+    "expected": "normal",
+    "reason": "OrderSummary checks for null before iterating and still returns zero"
+  },
+  "fix": {
+    "expected": "fixed",
+    "reason": "OrderService again returns an empty list for a missing customer"
+  }
+}

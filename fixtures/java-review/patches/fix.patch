@@ -1,0 +1,11 @@
+diff --git a/src/example/OrderService.java b/src/example/OrderService.java
+--- a/src/example/OrderService.java
++++ b/src/example/OrderService.java
+@@ -8,6 +8,6 @@ public final class OrderService {
+   public List<String> itemIds(String customerId) {
+     if (!orders.containsKey(customerId)) {
+-      return null;
++      return List.of();
+     }
+     return orders.get(customerId);
+   }
