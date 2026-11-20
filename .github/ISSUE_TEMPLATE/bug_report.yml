@@ -1,0 +1,90 @@
+name: Bug report
+description: Report something that does not work
+title: "[BUG] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never paste your `REVIEW_MODEL_API_KEY` or any other secret in this issue. Replace secrets with `***`. Everything posted here is public once the repository is open.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One line naming the behavior that is wrong. "The review command fails when the base revision does not exist" beats "review is broken".
+    validations:
+      required: true
+  - type: textarea
+    id: expected_actual
+    attributes:
+      label: Expected vs actual behavior
+      description: What should happen, and what happens instead. Quote the exact error text and the exit code.
+      placeholder: |
+        Expected:
+
+        Actual:
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands, in order, that trigger the bug. Redact secrets. If the bug involves a repository you cannot share, build a small fixture with the same shape and reference `fixtures/java-review`.
+      placeholder: |
+        1.
+        2.
+    validations:
+      required: true
+  - type: dropdown
+    id: reproducible
+    attributes:
+      label: Can you reproduce it consistently?
+      options:
+        - "Yes"
+        - "No"
+        - "Sometimes"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      description: macOS and Linux are the supported platforms.
+      options:
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Bun version, changed `review.config.json` limits, and the model provider, endpoint, and model ID. Never include the API key.
+      placeholder: |
+        Bun:
+        review.config.json changes:
+        Provider / endpoint / model ID:
+    validations:
+      required: false
+  - type: textarea
+    id: result
+    attributes:
+      label: Review output, if the bug is in a review run
+      description: The one-line JSON that the review command prints, plus `result.status` and the coverage from the run directory's `result.json`. Keep the API key out.
+      placeholder: |
+        Command output:
+
+        result.status:
+
+        coverage:
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and error output
+      description: The full error text and the relevant logs, with secrets replaced.
+    validations:
+      required: false
