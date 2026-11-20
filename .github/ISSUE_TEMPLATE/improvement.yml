@@ -1,0 +1,24 @@
+name: Improvement
+description: Propose a measurable improvement to correctness, performance, reliability, or developer workflow
+title: "[IMPROVEMENT] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Cleanup-only refactors, renames, and style edits are out of scope unless a maintainer asked for one as part of a real fix.
+  - type: textarea
+    id: current
+    attributes:
+      label: Current state
+      description: How it works now. Link the code, quote the snippet, or describe the observed behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: desired
+    attributes:
+      label: Desired state
+      description: What changes and the measurable outcome, with before and after numbers where you have them.
+    validations:
+      required: true

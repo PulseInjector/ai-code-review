@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest a new capability
+title: "[FEATURE] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check `PLAN.md` first. The plan fixes the scope and the segment order, and requests aligned with a planned segment are prioritized. Automatic fixes, generated tests, production deployment monitoring, fork PRs, multi-model voting, cross-repository indexing, and a standalone backend are out of scope.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: The pain or the gap today. State the problem, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How it should work. Cover the commands, the inputs and outputs, and one example.
+    validations:
+      required: true
