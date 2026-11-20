@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createJavaReviewRepository } from "../fixtures/java-review"
@@ -103,4 +103,7 @@ try {
   }
   await writeFile(join(root, "acceptance.json"), `${JSON.stringify(summary, null, 2)}\n`, { flag: "wx", mode: 0o600 })
   console.log(JSON.stringify(summary, null, 2))
-} finally { console.log(`Acceptance artifacts retained at ${root}`) }
+} finally {
+  await rm(repo, { recursive: true, force: true })
+  console.log(`Acceptance artifacts retained at ${root}`)
+}

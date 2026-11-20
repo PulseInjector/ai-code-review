@@ -8,8 +8,9 @@
   },
   "scripts": {
     "review": "bun run src/cli.ts",
+    "verify": "bun run src/verification/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test src/contracts.test.ts src/fixtures/java-review.test.ts src/context.test.ts src/discovery.test.ts src/report.test.ts src/review.test.ts src/runtime/runtime.test.ts src/runtime/worker-process.test.ts",
+    "test": "bun test src/contracts.test.ts src/fixtures/java-review.test.ts src/context.test.ts src/discovery.test.ts src/report.test.ts src/review.test.ts src/runtime/runtime.test.ts src/runtime/worker-process.test.ts src/verification/cli.test.ts",
     "smoke:sdk": "bun run src/smoke/sdk-lifecycle.ts",
     "smoke:model": "bun run src/smoke/sdk-model.ts",
     "smoke:review": "bun run src/smoke/review-acceptance.ts",

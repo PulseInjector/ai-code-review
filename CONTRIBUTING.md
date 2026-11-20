@@ -12,6 +12,7 @@ Check the working tree before starting. For a standalone change, create a task b
 
 Keep code, tests, and documentation consistent with the behavior changed. Run the checks relevant to the change and record what ran:
 
+- `bun run verify` for the default local suite and CLI journeys, or `bun run verify --area <name>` for a targeted group. See [Verification CLI](ENVIRONMENT.md#verification-cli) for scopes and evidence.
 - `bun run typecheck` for TypeScript changes.
 - `bun run smoke:sdk` for changes affecting SDK host startup or shutdown.
 - `bun run smoke:java` for changes affecting the Java toolchain.

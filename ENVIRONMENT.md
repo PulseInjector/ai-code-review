@@ -22,6 +22,18 @@ bun run smoke:java
 
 `typecheck` runs `tsc --noEmit`. The SDK check starts and closes an embedded host without requesting a model. The Java check compiles and runs a temporary class. Both smoke checks use temporary directories.
 
+## Verification CLI
+
+```sh
+bun run verify doctor
+bun run verify
+bun run verify --area snapshot
+```
+
+`doctor` checks the checkout, locked dependency versions, and local toolchain without starting the SDK. `verify` runs type checking, tests, and the SDK and Java checks, then drives the public `review` command on disposable Git repositories. Use `--area cli`, `--area snapshot`, `--area runtime`, or `--area java` to run one group. These checks do not contact a live model provider.
+
+The command prints an evidence directory containing `summary.json`, command logs, and any generated review reports. Temporary fixture repositories are removed; the evidence remains. A verification command exits `1` if a check fails. See the [project verification skill](.agents/skills/verify-ai-code-review/SKILL.md) for what each journey proves.
+
 ## Model Connection
 
 Copy `.env.example` to `.env.local` and set all four fields:
@@ -40,6 +52,8 @@ bun run smoke:model
 ```
 
 `bun run smoke:review` runs three full live reviews against the Java defect, guarded, and incomplete-material cases. The incomplete case makes the supporting caller exceed the snapshot limit. Successful and failed run artifacts remain under the printed temporary directory for inspection. Choose an output location without an ancestor `AGENTS.md`, so SDK tools cannot load ambient instructions.
+
+`bun run verify --live` runs the model smoke check first and, on success, runs the three-case acceptance. Both steps make live API calls and can incur charges. `bun run verify doctor --live` only checks that the four settings have the expected format; it does not contact the provider or validate credentials.
 
 This check creates an SDK session using the configured provider and model, waits for an assistant reply, and closes the host. It runs in an isolated child process so it does not read the host's existing OpenCode configuration. The check uses the OpenAI-compatible provider adapter, so the endpoint must support that protocol. Other provider protocols are outside this check's current support.
 

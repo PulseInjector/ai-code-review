@@ -90,12 +90,15 @@ async function runSession(options: {
       const messages = await listMessages(host, sessionID)
       const completed = completedTurn(messages, accepted.id)
       if (completed) {
-        const stats = await host.sessions.get({ sessionID })
-        usage = { kind: "known", inputTokens: stats.tokens.input, outputTokens: stats.tokens.output }
-        if (interruptRequested) return { name: prompt.name, sessionID, status: stopped(), error: "runtime interrupted the session", usage }
         const { idle, assistants, last } = completed
+        if (interruptRequested || idle.outcome === "interrupted") {
+          return { name: prompt.name, sessionID, status: stopped(), error: idle.error?.message ?? "runtime interrupted the session", usage }
+        }
+        const stats = await host.sessions.get({ sessionID })
+        if (interruptRequested) return { name: prompt.name, sessionID, status: stopped(), error: "runtime interrupted the session", usage }
+        usage = { kind: "known", inputTokens: stats.tokens.input, outputTokens: stats.tokens.output }
         if (idle.outcome !== "succeeded" || idle.error || assistants.some((message) => message.error)) {
-          return { name: prompt.name, sessionID, status: idle.outcome === "interrupted" ? "interrupted" : "failed", error: idle.error?.message ?? "model session failed", usage }
+          return { name: prompt.name, sessionID, status: "failed", error: idle.error?.message ?? "model session failed", usage }
         }
         const text = last?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n").trim()
         if (!text || last?.finish === "length" || last?.finish === "content-filter" || last?.finish === "error" || Buffer.byteLength(text) > 256 * 1024) {
