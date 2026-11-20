@@ -32,7 +32,7 @@ bun run verify --area snapshot
 
 `doctor` checks the checkout, locked dependency versions, and local toolchain without starting the SDK. `verify` runs type checking, tests, and the SDK and Java checks, then drives the public `review` command on disposable Git repositories. Use `--area cli`, `--area snapshot`, `--area runtime`, or `--area java` to run one group. These checks do not contact a live model provider.
 
-The command prints an evidence directory containing `summary.json`, command logs, and any generated review reports. Temporary fixture repositories are removed; the evidence remains. A verification command exits `1` if a check fails. See the [project verification skill](.agents/skills/verify-ai-code-review/SKILL.md) for what each journey proves.
+The command prints an evidence directory containing `summary.json`, command logs, and any generated review reports. Temporary fixture repositories are removed; the evidence remains. A verification command exits `1` if a check fails. See the [project verification skill](.claude/skills/verify-ai-code-review/SKILL.md) for what each journey proves. A relative symlink at `.agents/skills/verify-ai-code-review` keeps the same content discoverable for agents that read `.agents/skills` instead.
 
 ## Model Connection
 
