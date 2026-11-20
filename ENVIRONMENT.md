@@ -51,7 +51,7 @@ Copy `.env.example` to `.env.local` and set all four fields:
 bun run smoke:model
 ```
 
-`bun run smoke:review` runs three full live reviews against the Java defect, guarded, and incomplete-material cases. The incomplete case makes the supporting caller exceed the snapshot limit. Successful and failed run artifacts remain under the printed temporary directory for inspection. Choose an output location without an ancestor `AGENTS.md`, so SDK tools cannot load ambient instructions.
+`bun run smoke:review` runs three full live reviews against the Java defect, guarded, and incomplete-material cases. The incomplete case makes the supporting caller exceed the snapshot limit. Successful and failed run artifacts remain under the printed temporary directory for inspection. To keep a run, use `~/.local/share/ai-code-review/runs/<date>-<case>/`, for example `~/.local/share/ai-code-review/runs/20261120-defect/`. That location has no ancestor `AGENTS.md`, so SDK tools cannot load ambient instructions.
 
 `bun run verify --live` runs the model smoke check first and, on success, runs the three-case acceptance. Both steps make live API calls and can incur charges. `bun run verify doctor --live` only checks that the four settings have the expected format; it does not contact the provider or validate credentials.
 

@@ -2,9 +2,11 @@
 
 This guide covers changes made from a source checkout. Environment setup and model configuration are in [ENVIRONMENT.md](ENVIRONMENT.md).
 
+Write review runs outside the repository, and never commit run artifacts. [ENVIRONMENT.md](ENVIRONMENT.md#local-review-preparation) names the recommended output location.
+
 ## Start a Change
 
-If `.local/project-context.md` exists, read it for local project context before starting a task. Keep private links and notes out of commits and shared PR descriptions.
+Read `PLAN.md` before starting a task. It records the current feature segment, its checkpoints, and its acceptance criteria. Keep personal notes, private planning links, and run artifacts out of commits, pull requests, and shared documentation.
 
 Check the working tree before starting. For a standalone change, create a task branch from `main`. For a feature with several development checkpoints, create an integration branch from `main`. Work through the checkpoints in order on that branch, using local task branches when isolation helps. Keep commits focused. Use short, descriptive lowercase branch names with a prefix such as `feat/`, `fix/`, `docs/`, or `chore/` (for example, `docs/development-workflow`).
 
