@@ -8,7 +8,7 @@ import { createContextLimitsPlugin } from "./context-limits"
 import { createRequestPolicyPlugin, modelTransportFetch, stageTimeoutCode, type PhaseState, type RequestPolicy, type SessionRequestError } from "./request-policy"
 import {
   emptyReadBudget, emptyRequestLedger, submissionSchema, sumUsage, unknownUsage,
-  type PhaseDeadlines, type PhaseResult, type RuntimeResult, type Submission, type WorkerInput,
+  type PhaseDeadlines, type PhaseResult, type RuntimeResult, type Submission, type WorkerInput, type WorkerProgress,
 } from "./contracts"
 import { validateDiscoveryText, validateVerificationText } from "../phase-validation"
 import type { Candidate } from "../contracts"
@@ -241,7 +241,7 @@ async function runSession(options: {
     })
     if (submitted.kind === "stopped") return interruptedResult()
     if (submitted.kind === "failed") {
-      return { name: prompt.name, sessionID, status: "failed", error: submitted.message, code: submitted.code, usage }
+      return { name: prompt.name, sessionID, status: submitted.code === stageTimeoutCode(phase.phase) ? "timeout" : "failed", error: submitted.message, code: submitted.code, usage }
     }
     const promptID = submitted.userMessageId
     while (true) {
@@ -259,7 +259,7 @@ async function runSession(options: {
         }
         if (terminalError || idle.outcome !== "succeeded") {
           const code = sessionFailureCode(terminalError, policy, sessionID)
-          return { name: prompt.name, sessionID, status: "failed", error: terminalError?.message ?? "model session failed", code, usage }
+          return { name: prompt.name, sessionID, status: code === stageTimeoutCode(phase.phase) ? "timeout" : "failed", error: terminalError?.message ?? "model session failed", code, usage }
         }
         if (!text || last?.finish === "length" || last?.finish === "error" || Buffer.byteLength(text) > 256 * 1024) {
           return { name: prompt.name, sessionID, status: "failed", error: "model returned no usable complete assistant text", code: "model-format", usage }
@@ -293,7 +293,19 @@ class RuntimeClassifiedError extends Error {
   }
 }
 
-export async function runRuntime(input: WorkerInput, signal: AbortSignal, onProgress: (result: RuntimeResult) => void, discoveryDeadline?: AbortSignal): Promise<RuntimeResult> {
+function validationFailureCode(message: string): Failure["code"] {
+  if (/line range|excerpt|citation|snapshot:/iu.test(message)) return "citation-invalid"
+  if (/candidate/iu.test(message)) return "candidate-set-invalid"
+  return "model-format"
+}
+
+export async function runRuntime(
+  input: WorkerInput,
+  signal: AbortSignal,
+  onProgress: (progress: WorkerProgress) => void,
+  discoveryDeadline?: AbortSignal,
+  createHost = OpenCode.create,
+): Promise<RuntimeResult> {
   const controller = new AbortController()
   let stopped: "interrupted" | "read-budget-exhausted" = "interrupted"
   const budget = emptyReadBudget()
@@ -309,13 +321,13 @@ export async function runRuntime(input: WorkerInput, signal: AbortSignal, onProg
   let checkpointSequence = 0
   const sessions: PhaseResult[] = []
   const cleanup: RuntimeResult["cleanup"] = { hostClosed: false, forced: false }
-  const progress = (): RuntimeResult => ({
-    status: "interrupted", error: "runtime is in progress", code: "run-interrupted", sessions,
-    usage: unknownUsage("active session usage is not settled"), readBudget: budget, cleanup,
-    checkpointSequence: ++checkpointSequence, submission, requests: ledger, phaseDeadlines: echoedDeadlines,
-  })
   let host: OpenCode.Interface | undefined
   let outcome: RuntimeResult | undefined
+  const emitProgress = () => {
+    const checkpoint = { sessions: [...sessions], readBudget: budget, cleanup: { ...cleanup }, checkpointSequence: ++checkpointSequence, submission, requests: ledger, phaseDeadlines: { ...echoedDeadlines } }
+    if (outcome) onProgress({ kind: "terminal", record: { ...outcome, ...checkpoint } })
+    else onProgress({ kind: "running", record: { ...checkpoint, usage: unknownUsage("active session usage is not settled") } })
+  }
   let phaseActive = false
   const interruptDiscovery = () => {
     if (phaseActive && phaseState.phase === "discovery") controller.abort("discovery-timeout")
@@ -340,9 +352,9 @@ export async function runRuntime(input: WorkerInput, signal: AbortSignal, onProg
     const policy = createRequestPolicyPlugin({
       ledger,
       phase: () => phaseState,
-      onChange: () => onProgress(progress()),
+      onChange: emitProgress,
     })
-    const creating = OpenCode.create({
+    const creating = createHost({
       fetch: modelTransportFetch,
       config: {
         directory: input.configDirectory, project: false, claude: false,
@@ -355,7 +367,7 @@ export async function runRuntime(input: WorkerInput, signal: AbortSignal, onProg
       },
       models: { fetch: false }, fs: { filewatcher: false },
       plugins: [createContextLimitsPlugin({ limits: input.readLimits, budget, materialDirectory: input.materialDirectory,
-        onChange: () => onProgress(progress()), onExhausted: () => { stopped = "read-budget-exhausted"; controller.abort() } }),
+        onChange: emitProgress, onExhausted: () => { stopped = "read-budget-exhausted"; controller.abort() } }),
         policy.plugin],
     })
     void creating.then((created) => {
@@ -379,9 +391,10 @@ export async function runRuntime(input: WorkerInput, signal: AbortSignal, onProg
     clearInitTimer()
     let previousOutput: string | undefined
     let discovered: Candidate[] | undefined
+    const validation = input.phaseValidation ?? { changedHeadPaths: [], includedFiles: [] }
     for (const prompt of input.prompts) {
       if (controller.signal.aborted || Date.now() >= input.phaseDeadlines.analysisStopEpochMs) break
-      if (prompt.name === "verify" && input.phaseValidation && !discovered) throw new Error("verification requires a validated discovery result")
+      if (prompt.name === "verify" && !discovered) throw new Error("verification requires a validated discovery result")
       const text = resolvePhasePrompt(prompt.text, previousOutput)
       // Discovery owns a fresh 120-second window from its actual start, bounded by the analysis
       // stop. The concrete deadline is echoed in every progress record so the parent's interrupt
@@ -393,20 +406,32 @@ export async function runRuntime(input: WorkerInput, signal: AbortSignal, onProg
         phaseState = { phase: "verification", deadlineEpochMs: input.phaseDeadlines.analysisStopEpochMs }
       }
       submission = { kind: "not-submitted" }
-      onProgress(progress())
+      emitProgress()
       phaseActive = true
       const phaseStarted = Date.now()
-      const result = { ...await runSession({ host, input, prompt: { ...prompt, text }, signal: controller.signal, stopped: () => stopped, phase: phaseState, policy, reportSubmission: (value) => { submission = value; onProgress(progress()) }, }), durationMs: Date.now() - phaseStarted }
+      const settled = await runSession({ host, input, prompt: { ...prompt, text }, signal: controller.signal, stopped: () => stopped, phase: phaseState, policy, reportSubmission: (value) => { submission = value; emitProgress() } })
+      let result = settled
+      if (settled.status === "complete") {
+        const { text, ...phase } = settled
+        try {
+          const validated = await withinDeadline(async () => {
+            if (prompt.name === "discover") return validateDiscoveryText(text, validation, input.materialDirectory)
+            if (prompt.name === "verify") await validateVerificationText(text, discovered ?? [], validation, input.materialDirectory)
+          }, phaseState.deadlineEpochMs)
+          const code = stageTimeoutCode(phaseState.phase)
+          if (validated.kind === "timed-out" || controller.signal.reason === code || Date.now() >= phaseState.deadlineEpochMs) {
+            result = { ...phase, status: "timeout", error: "the phase deadline elapsed before its output was validated", code }
+          } else if (validated.value !== undefined) discovered = validated.value
+        } catch (error) {
+          const message = boundedErrorText(error)
+          result = { ...phase, status: "failed", error: message, code: validationFailureCode(message) }
+        }
+      }
       phaseActive = false
-      sessions.push(result)
-      onProgress(progress())
+      sessions.push({ ...result, durationMs: Date.now() - phaseStarted })
       if (result.status !== "complete") break
       previousOutput = result.text
-      if (input.phaseValidation && prompt.name === "discover") {
-        discovered = await validateDiscoveryText(result.text, input.phaseValidation, input.materialDirectory)
-      } else if (input.phaseValidation && prompt.name === "verify") {
-        await validateVerificationText(result.text, discovered ?? [], input.phaseValidation, input.materialDirectory)
-      }
+      emitProgress()
     }
     const failed = sessions.find((session) => session.status !== "complete")
     if (failed) outcome = { status: failed.status, error: failed.error, code: failed.code, sessions, usage: sumUsage(sessions), readBudget: budget, cleanup, checkpointSequence: ++checkpointSequence, submission, requests: ledger, phaseDeadlines: echoedDeadlines }
@@ -427,37 +452,24 @@ export async function runRuntime(input: WorkerInput, signal: AbortSignal, onProg
     // A failed run no longer waits on its pending SDK create: when it settles later, the abandoned
     // host closes instead of keeping the worker's event loop alive.
     abandonedCreate = true
-    // The runtime terminal classifier owns the authoritative mapping. Validation errors surface
-    // between phases with completed sessions on record and carry the citation, candidate-set, or
-    // format class; infrastructure errors during an active phase or before any session are runtime
-    // initialization failures.
-    const message = error instanceof Error ? error.message : String(error)
-    let code: Failure["code"]
-    if (error instanceof RuntimeClassifiedError) code = error.code
-    else if (/line range|excerpt|citation|snapshot:/iu.test(message)) code = "citation-invalid"
-    else if (/candidate/iu.test(message)) code = "candidate-set-invalid"
-    else if (phaseActive || sessions.length === 0) code = "runtime-init"
-    else code = "model-format"
+    const message = boundedErrorText(error)
+    const code = error instanceof RuntimeClassifiedError ? error.code
+      : phaseActive || sessions.length === 0 ? "runtime-init" : validationFailureCode(message)
     outcome = { status: "failed", error: message, code, sessions, usage: !phaseActive && sessions.length ? sumUsage(sessions) : unknownUsage("runtime failed before usage settled"), readBudget: budget, cleanup, checkpointSequence: ++checkpointSequence, submission, requests: ledger, phaseDeadlines: echoedDeadlines }
   } finally {
     signal.removeEventListener("abort", forwardAbort)
     discoveryDeadline?.removeEventListener("abort", interruptDiscovery)
     clearInitTimer()
-    try {
-      if (host) { await host.close(); cleanup.hostClosed = true }
-    } catch (error) {
-      // The close failure is recorded beside the primary outcome. An outright model failure keeps
-      // its own terminal code, and a close failure after completed work surfaces through the
-      // cleanup check instead of erasing the settled result.
-      cleanup.closeFailure = boundedErrorText(error)
-      if (outcome === undefined) {
-        outcome = {
-          status: "failed", error: `SDK host cleanup failed: ${cleanup.closeFailure}`, code: "cleanup-failed",
-          sessions, usage: unknownUsage("runtime failed before usage settled"), readBudget: budget, cleanup,
-          checkpointSequence: ++checkpointSequence, submission, requests: ledger, phaseDeadlines: echoedDeadlines,
-        }
+    // Save the business outcome before waiting on SDK cleanup, which can hang until the kill.
+    try { emitProgress() }
+    finally {
+      try {
+        if (host) { await host.close(); cleanup.hostClosed = true }
+      } catch (error) {
+        cleanup.closeFailure = boundedErrorText(error)
       }
+      emitProgress()
     }
   }
-  return outcome
+  return { ...outcome, checkpointSequence: ++checkpointSequence }
 }

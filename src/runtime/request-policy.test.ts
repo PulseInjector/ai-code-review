@@ -73,10 +73,6 @@ describe("response recording", () => {
     hooks["http.request"]!(requestEvent("primary") as never)
     expect(ledger.records.at(-1)!.attempt).toBe(1)
     hooks["http.response"]!({ sessionID: "session", request: primary, response: { status: 500 } } as never)
-    // A retriable response with no retry decision makes the next request a hidden-retry
-    // continuation, which is the path the SDK's own retry loops take.
-    hooks["http.request"]!(requestEvent("primary") as never)
-    expect(ledger.records.at(-1)!.attempt).toBe(2)
   })
 
   test("a retry decision closes the session's one outstanding record as a transport error", async () => {
@@ -180,14 +176,16 @@ describe("retry decisions", () => {
 })
 
 describe("per-call attempt cap", () => {
-  test("a fourth wire attempt of a hidden retry loop is stopped with retry-exhausted", async () => {
+  test("a fourth wire attempt is stopped even if the SDK tries to send it", async () => {
     const now = { value: 1_000 }
     const { hooks, ledger, policy } = await policyHarness({ phase: discoveryPhase(now.value + 60_000), now: () => now.value })
     for (let attempt = 1; attempt <= 3; attempt++) {
-      hooks["http.request"]!({ sessionID: "session", kind: "generate", request: { url: `https://provider.test/${attempt}` } } as never)
+      if (attempt > 1) hooks["retry"]!(retryEvent({ type: "provider.transport" }, "session", attempt) as never)
+      hooks["model.request"]!(requestEvent("primary") as never)
+      hooks["http.request"]!(requestEvent("primary") as never)
     }
     expect(ledger.records.map((record) => record.attempt)).toEqual([1, 2, 3])
-    expect(() => hooks["http.request"]!({ sessionID: "session", kind: "generate", request: { url: "https://provider.test/4" } } as never))
+    expect(() => hooks["http.request"]!(requestEvent("primary") as never))
       .toThrow("three attempts")
     expect(ledger.records).toHaveLength(3)
     expect(policy.stopCode("session")).toBe("retry-exhausted")

@@ -12,9 +12,9 @@ type Scenario =
   | "ambiguous"
   | "quota-conflict"
   | "title-failure"
-  | "generate-retry-cap"
+  | "generate-blocked"
   | "compaction-retry-cap"
-  | "compaction-redirect"
+  | "compaction-terminal"
   | "stream-retry"
 
 type DriverObservation = {
@@ -27,6 +27,7 @@ type DriverObservation = {
   matchingUserMessages?: number
   userTextSamples?: string[]
   generatedText?: string
+  policyStop?: string | null
   primaryAttempts?: number[]
   elapsedMs?: number
   attemptsByKind?: Record<string, number[]>
@@ -40,6 +41,7 @@ type RequestKind = "primary" | "compaction" | "title" | "generate"
 type ScriptServer = {
   port: number
   counts(): Record<RequestKind, number>
+  times: Record<RequestKind, number[]>
   paths: string[]
   stop(): Promise<void>
 }
@@ -64,13 +66,13 @@ const streamResponse = (text: string): Response => new Response(
   { status: 200, headers: { "content-type": "text/event-stream" } },
 )
 
-const errorResponse = (status: number, body: Record<string, unknown>): Response =>
-  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } })
+const errorResponse = (status: number, body: Record<string, unknown>, headers?: Record<string, string>): Response =>
+  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } })
 
 // OpenAI's account-cap phrasing on HTTP 429: the status alone looks like a throttle, but the
 // insufficient_quota code makes the SDK classify the failure as provider.quota.
 const insufficientQuotaResponse = (): Response =>
-  errorResponse(429, { error: { message: "You exceeded your current quota limits, please check your plan and billing details.", code: "insufficient_quota" } })
+  errorResponse(429, { error: { message: "You exceeded your current quota limits, please check your plan and billing details.", code: "insufficient_quota" } }, { "x-should-retry": "true" })
 
 function classifyKind(body: string): RequestKind {
   if (body.includes("Reply with only the title.")) return "title"
@@ -81,6 +83,7 @@ function classifyKind(body: string): RequestKind {
 
 async function startScriptServer(script: (kind: RequestKind, kindIndex: number) => Response): Promise<ScriptServer> {
   const counts: Record<RequestKind, number> = { primary: 0, compaction: 0, title: 0, generate: 0 }
+  const times: ScriptServer["times"] = { primary: [], compaction: [], title: [], generate: [] }
   const paths: string[] = []
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -90,15 +93,16 @@ async function startScriptServer(script: (kind: RequestKind, kindIndex: number) 
       const body = JSON.stringify(JSON.parse(await request.text()))
       const kind = classifyKind(body)
       counts[kind] += 1
+      times[kind].push(performance.now())
       return script(kind, counts[kind])
     },
   })
   const port = server.port
   if (port === undefined) throw new Error("the scripted server did not bind a port")
-  return { port, counts: () => ({ ...counts }), paths, stop: () => server.stop(true) }
+  return { port, counts: () => ({ ...counts }), times, paths, stop: () => server.stop(true) }
 }
 
-async function driveScenario(scenario: Scenario, script: (kind: RequestKind, kindIndex: number) => Response, timeoutMs = 90_000): Promise<DriverObservation & { serverCounts: Record<RequestKind, number>; paths: string[] }> {
+async function driveScenario(scenario: Scenario, script: (kind: RequestKind, kindIndex: number) => Response, timeoutMs = 90_000): Promise<DriverObservation & { serverCounts: Record<RequestKind, number>; times: ScriptServer["times"]; paths: string[] }> {
   const root = await mkdtemp(join(tmpdir(), "scripted-provider-"))
   const server = await startScriptServer(script)
   try {
@@ -136,44 +140,52 @@ async function driveScenario(scenario: Scenario, script: (kind: RequestKind, kin
       throw new Error(`scripted driver failed: ${detail || "no diagnostic output"}${samples}`)
     }
     if (observation === undefined) throw new Error("scripted driver wrote no observation")
-    return { ...observation, serverCounts: server.counts(), paths: server.paths }
+    return { ...observation, serverCounts: server.counts(), times: server.times, paths: server.paths }
   } finally {
     await server.stop()
     await rm(root, { recursive: true, force: true })
   }
 }
 
-// The blocking gate: the actual installed SDK and plugin must route every request kind through
-// the session hooks, and no logical model call may exceed three attempts on the wire whatever
-// retry path the SDK uses. If a kind bypasses the hooks or exceeds the cap, this test fails and
-// the claim is withdrawn rather than weakened.
-test("primary, compaction, title, and generate requests all pass through the session hooks", async () => {
-  const observation = await driveScenario("kinds", () => streamResponse("OK"))
+// Blocking checkpoint gate: the real SDK must account for each supported request kind, enforce
+// retry decisions on the wire, and reject the standalone generate path before transmission.
+test("primary, foreground compaction, and optional title each succeed with one recorded POST", async () => {
+  const observation = await driveScenario("kinds", (kind) => streamResponse(kind === "compaction" ? "## Objective\n- Review the change." : "OK"))
   const kinds = observation.requests.records.map((record) => record.kind)
   expect(kinds).toContain("primary")
   expect(kinds).toContain("title")
-  expect(kinds).toContain("generate")
   expect(kinds).toContain("compaction")
   expect(observation.requests.records.every((record) => record.sessionId === observation.sessionID)).toBe(true)
   expect(observation.requests.records.filter((record) => record.outcome === "response")).toHaveLength(observation.requests.records.length)
-  expect(observation.generatedText).toBe("OK")
   expect(observation.requests.capped).toBe(false)
   expect(observation.turn?.outcome).toBe("succeeded")
-  for (const kind of ["primary", "compaction", "title", "generate"] as const) {
-    expect(observation.serverCounts[kind]).toBeGreaterThan(0)
-  }
+  expect(observation.serverCounts).toEqual({ primary: 1, compaction: 1, title: 1, generate: 0 })
+  expect(observation.attemptsByKind).toEqual({ primary: [1], compaction: [1], title: [1] })
 }, 120_000)
 
-test("two 500 responses retry through the hook and the third attempt succeeds", async () => {
-  const observation = await driveScenario("retry-recovered", (kind, index) => kind === "primary" && index <= 2 ? errorResponse(500, { error: "server unavailable" }) : streamResponse("OK"))
+test("primary retries observe Retry-After and the third attempt succeeds", async () => {
+  const observation = await driveScenario("retry-recovered", (kind, index) => {
+    if (kind === "primary" && index === 1) return errorResponse(429, { error: "rate limit" }, { "retry-after": "2" })
+    if (kind === "primary" && index === 2) return errorResponse(500, { error: "server unavailable" })
+    return streamResponse("OK")
+  })
   const attempts = observation.requests.records.filter((record) => record.kind === "primary").map((record) => record.attempt)
   expect(attempts).toEqual([1, 2, 3])
   expect(observation.requests.records.at(-1)?.status).toBe(200)
-  // The deterministic delays are 1,000 and 2,000 ms, so the recovered turn cannot be faster.
-  expect(observation.elapsedMs ?? 0).toBeGreaterThanOrEqual(3_000)
   expect(observation.turn?.outcome).toBe("succeeded")
   expect(observation.serverCounts.title).toBe(0)
   expect(observation.serverCounts.primary).toBe(3)
+  const [first, second, third] = observation.times.primary
+  expect(second! - first!).toBeGreaterThanOrEqual(2_000)
+  expect(third! - second!).toBeGreaterThanOrEqual(2_000)
+}, 120_000)
+
+test("a Retry-After longer than the phase budget does not schedule another POST", async () => {
+  const observation = await driveScenario("retry-exhausted", () => errorResponse(429, { error: "rate limit" }, { "retry-after": "180" }))
+  expect(observation.serverCounts.primary).toBe(1)
+  expect(observation.attemptsByKind?.primary).toEqual([1])
+  expect(observation.turn).toEqual({ outcome: "failed", errorType: "provider.rate-limit" })
+  expect(observation.policyStop).toBe("discovery-timeout")
 }, 120_000)
 
 test("a primary stream transport error keeps its retry record after HTTP 200", async () => {
@@ -209,19 +221,20 @@ test("an ambiguous prompt response recovers through the same session and uses on
   expect(observation.turn?.outcome).toBe("succeeded")
 }, 120_000)
 
-test("generate requests retry through the SDK's own loop and stop at three wire attempts", async () => {
-  // The generate kind bypasses the session retry hook, so only the transport-level cap holds.
-  // The SDK's internal sleeps span roughly two to sixteen seconds per retry before the stop.
-  const observation = await driveScenario("generate-retry-cap", (kind) => kind === "generate" ? errorResponse(500, { error: "server unavailable" }) : streamResponse("OK"), 150_000)
-  expect(observation.attemptsByKind?.generate).toEqual([1, 2, 3])
-  expect(observation.serverCounts.generate).toBe(3)
+const authWithRetryHint = () => errorResponse(401, { error: { message: "invalid key" } }, { "x-should-retry": "true" })
+
+test("standalone SDK generate is rejected before it can retry a credential error", async () => {
+  const observation = await driveScenario("generate-blocked", authWithRetryHint)
+  expect(observation.serverCounts.generate).toBe(0)
+  expect(observation.paths).toEqual([])
+  expect(observation.attemptsByKind?.generate).toBeUndefined()
   expect(observation.outcome?.kind).toBe("generate-failed")
+  expect(observation.policyStop).toBe("model-config")
   expect(observation.generatedText).toBeUndefined()
-}, 180_000)
+}, 120_000)
 
 const redirectScenarios: Array<[RequestKind, Scenario]> = [
-  ["generate", "generate-retry-cap"], ["primary", "retry-exhausted"],
-  ["compaction", "compaction-redirect"], ["title", "title-failure"],
+  ["primary", "retry-exhausted"], ["compaction", "compaction-terminal"], ["title", "title-failure"],
 ]
 for (const [target, scenario] of redirectScenarios) {
   test(`the embedded transport never follows a ${target} POST redirect`, async () => {
@@ -243,8 +256,20 @@ test("compaction requests retry through the hook and stop at three wire attempts
   expect(observation.elapsedMs ?? 0).toBeGreaterThanOrEqual(3_000)
 }, 120_000)
 
+for (const [failure, response] of [
+  ["payload rejection", () => errorResponse(413, { error: "payload too large" })],
+  ["invalid summary", () => streamResponse("No template headings")],
+] as const) {
+  test(`a compaction ${failure} cannot trigger an unapproved resend`, async () => {
+    const observation = await driveScenario("compaction-terminal", (kind) => kind === "compaction" ? response() : streamResponse("OK"))
+    expect(observation.serverCounts.compaction).toBe(1)
+    expect(observation.attemptsByKind?.compaction).toEqual([1])
+    expect(observation.policyStop).toBe("model-format")
+  }, 120_000)
+}
+
 test("a failed title request is recorded once and the SDK never retries it", async () => {
-  const observation = await driveScenario("title-failure", (kind) => kind === "title" ? errorResponse(500, { error: "server unavailable" }) : streamResponse("OK"))
+  const observation = await driveScenario("title-failure", (kind) => kind === "title" ? errorResponse(500, { error: "server unavailable" }, { "x-should-retry": "true" }) : streamResponse("OK"))
   expect(observation.attemptsByKind?.title).toEqual([1])
   expect(observation.serverCounts.title).toBe(1)
   expect(observation.requests.records.find((record) => record.kind === "title")?.status).toBe(500)
@@ -258,6 +283,13 @@ test("a 429 insufficient_quota is classified provider.quota and never retries de
   expect(observation.requests.records.find((record) => record.kind === "primary")?.status).toBe(429)
   expect(observation.turn?.outcome).toBe("failed")
   expect(observation.turn?.errorType).toBe("provider.quota")
+}, 120_000)
+
+test("primary ignores a provider retry hint on HTTP 401", async () => {
+  const observation = await driveScenario("retry-exhausted", authWithRetryHint)
+  expect(observation.serverCounts.primary).toBe(1)
+  expect(observation.attemptsByKind?.primary).toEqual([1])
+  expect(observation.turn).toEqual({ outcome: "failed", errorType: "provider.auth" })
 }, 120_000)
 
 test("a discovery signal delivered during verification does not interrupt it", async () => {

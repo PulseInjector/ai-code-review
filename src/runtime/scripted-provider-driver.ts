@@ -16,9 +16,9 @@ type Scenario =
   | "ambiguous"
   | "quota-conflict"
   | "title-failure"
-  | "generate-retry-cap"
+  | "generate-blocked"
   | "compaction-retry-cap"
-  | "compaction-redirect"
+  | "compaction-terminal"
   | "stream-retry"
 
 type DriverConfig = {
@@ -49,6 +49,7 @@ type Observation = {
   matchingUserMessages?: number
   userTextSamples?: string[]
   generatedText?: string
+  policyStop?: ReturnType<typeof policy.stopCode>
   primaryAttempts?: number[]
   elapsedMs?: number
   attemptsByKind?: Record<string, number[]>
@@ -154,9 +155,7 @@ try {
     if (outcome.kind !== "accepted") throw new Error(`recovery did not accept the delivered prompt: ${JSON.stringify(outcome)}`)
     const recovered = await waitForTurn(session.id, outcome.userMessageId)
     observation.turn = { outcome: recovered.idle.outcome, errorType: recovered.idle.error?.type ?? null }
-  } else if (config.scenario === "generate-retry-cap") {
-    // The generate request kind retries through the SDK's own loop without any retry hook, so the
-    // per-call cap must hold at the transport hook: three wire attempts, then a stop.
+  } else if (config.scenario === "generate-blocked") {
     const session = await createSession()
     observation.sessionID = session.id
     const started = Date.now()
@@ -169,7 +168,7 @@ try {
     }
     observation.elapsedMs = Date.now() - started
     observation.generatedText = generated
-  } else if (config.scenario === "compaction-retry-cap" || config.scenario === "compaction-redirect") {
+  } else if (config.scenario === "compaction-retry-cap" || config.scenario === "compaction-terminal") {
     const session = await createSession()
     observation.sessionID = session.id
     const inbox = await host.sessions.prompt({ sessionID: session.id, text: "Reply with OK." })
@@ -195,13 +194,11 @@ try {
     observation.primaryAttempts = ledger.records.filter((record) => record.kind === "primary").map((record) => record.attempt)
     if (config.scenario === "kinds") {
       await waitForRecord("title")
-      const generated = await host.sessions.generate({ sessionID: session.id, prompt: "Say done." })
-      observation.generatedText = generated.text
       await host.sessions.compact({ sessionID: session.id })
       await waitForRecord("compaction")
       const compactionDeadline = Date.now() + 15_000
-      while (Date.now() < compactionDeadline) {
-        if ((await listMessages(host, session.id)).some((message) => message.type === "compaction" && message.status === "completed")) break
+      while (!(await listMessages(host, session.id)).some((message) => message.type === "compaction" && message.status === "completed")) {
+        if (Date.now() >= compactionDeadline) throw new Error("the foreground compaction did not complete")
         await sleep(250)
       }
     }
@@ -212,6 +209,7 @@ try {
     }
   }
   observation.attemptsByKind = attemptsByKind()
+  observation.policyStop = policy.stopCode(observation.sessionID)
   await host.close()
   writeFileSync(`${outputPath}.tmp`, JSON.stringify(observation), { mode: 0o600 })
   renameSync(`${outputPath}.tmp`, outputPath)

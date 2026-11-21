@@ -5,7 +5,8 @@ import { completedTurn, listMessages, readOnlyPermissions, recoverAcceptedPrompt
 import { buildWorkerEnvironment, loadModelConfiguration, serializeWorkerInput, type WorkerOptions } from "./worker-process"
 import { createBudget, systemClock, workerPhaseDeadlines } from "../budget"
 import type { SessionMessageInfo } from "@opencode/client"
-import type { Submission } from "./contracts"
+import { OpenCode } from "@opencode/sdk"
+import type { Submission, WorkerProgress } from "./contracts"
 
 const config: WorkerOptions = {
   model: { providerID: "local-model", baseURL: "http://127.0.0.1:8080/v1", modelID: "model-a" },
@@ -317,3 +318,48 @@ test("an initialization that reaches the preparation deadline is cut off with ru
     await rm(root, { recursive: true, force: true })
   }
 }, 30_000)
+
+test("a fatal setup outcome is durable before the SDK host closes", async () => {
+  const { mkdtemp, mkdir, rm } = await import("node:fs/promises")
+  const { tmpdir } = await import("node:os")
+  const { join } = await import("node:path")
+  const root = await mkdtemp(join(tmpdir(), "review-blocked-close-"))
+  const configDirectory = join(root, "config")
+  const materialDirectory = join(root, "material")
+  const previousKey = process.env.OPENAI_API_KEY
+  const closing = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const progress: WorkerProgress[] = []
+  let pending: ReturnType<typeof runRuntime> | undefined
+  try {
+    await mkdir(configDirectory)
+    await mkdir(materialDirectory)
+    process.env.OPENAI_API_KEY = "blocked-close-key"
+    const input = workerInputSchema.parse({ ...JSON.parse(serializeWorkerInput({ ...config, materialDirectory }, workerPhaseDeadlines(createBudget(systemClock, 300_000)))), configDirectory })
+    pending = runRuntime(input, new AbortController().signal, (record) => progress.push(record), undefined, async (options) => {
+      const host = await OpenCode.create(options)
+      return {
+        ...host,
+        model: { ...host.model, list: async () => ({ data: [], cursor: {}, location: { directory: materialDirectory } }) },
+        close: async () => {
+          closing.resolve()
+          await release.promise
+          await host.close()
+        },
+      }
+    })
+    await Promise.race([closing.promise, pending.then(() => { throw new Error("the host did not enter cleanup") })])
+    expect(progress.at(-1)).toMatchObject({
+      kind: "terminal", record: { status: "failed", code: "model-config", cleanup: { hostClosed: false } },
+    })
+    release.resolve()
+    expect(await pending).toMatchObject({ status: "failed", code: "model-config", cleanup: { hostClosed: true } })
+    expect(progress.at(-1)).toMatchObject({ kind: "terminal", record: { status: "failed", code: "model-config", cleanup: { hostClosed: true } } })
+  } finally {
+    release.resolve()
+    await pending?.catch(() => undefined)
+    if (previousKey === undefined) delete process.env.OPENAI_API_KEY
+    else process.env.OPENAI_API_KEY = previousKey
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)

@@ -48,6 +48,7 @@ export type ReviewOptions = {
   progress?: ProgressSink
   gitEnvironment?: Record<string, string>
   attemptStartedAt?: string
+  afterExport?: () => Promise<void>
   finalizeReplay?: (run: ReviewRun, signal: AbortSignal) => Promise<PrReviewResult | ReviewResult>
 }
 
@@ -91,6 +92,7 @@ export async function runReview(input: ReviewInput, options: ReviewOptions = {})
   ), phaseDeadlines.prepareInitEpochMs)
   if (exported.kind === "timed-out") throw new BudgetExhaustedError("review exceeded the run deadline during preparation", "prepare-init")
   const context = exported.value
+  if (options.afterExport !== undefined) await options.afterExport()
   emit({ phase: "preparation", event: "end", changedFilesIncluded: includedChanges(context), changedFilesTotal: context.changes.length, candidatesDiscovered: null, candidatesVerified: null, runUrl: null })
   const preparationMs = Date.now() - started
   let configuration = options.configuration

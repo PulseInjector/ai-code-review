@@ -1,7 +1,7 @@
 import { readFileSync, renameSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import { runtimeFailure, workerInputSchema, type RuntimeResult } from "./contracts"
+import { runtimeFailure, workerInputSchema, type RuntimeResult, type WorkerProgress } from "./contracts"
 import { runRuntime } from "./opencode-v227"
 
 const inputPath = process.argv[2]
@@ -15,7 +15,7 @@ const onDiscoveryDeadline = () => discoveryDeadline.abort()
 process.on("SIGINT", onInterrupt)
 process.on("SIGUSR2", onDiscoveryDeadline)
 const apiKey = process.env.OPENAI_API_KEY
-function save(path: string, value: RuntimeResult) {
+function save(path: string, value: RuntimeResult | WorkerProgress) {
   const serialized = JSON.stringify(value)
   writeFileSync(`${path}.tmp`, apiKey ? serialized.replaceAll(apiKey, "[REDACTED]") : serialized, { mode: 0o600 })
   renameSync(`${path}.tmp`, path)

@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, expect, test } from "bun:test"
-import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { mkdirSync } from "node:fs"
+import { access, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createBudget, systemClock, type Clock } from "./budget"
-import { createGitHubReader, readExecutionContext, type FetchLike, type GitHubReader, type GitObservation } from "./github"
+import { createGitHubReader, readExecutionContext, type FetchLike, type FixedRepository, type GitHubReader, type GitObservation } from "./github"
 import { createJavaReviewRepository, type JavaReviewCommits } from "./fixtures/java-review"
 import { boundCoverageForPublication, runPrReview } from "./pr-review"
 import { runReview } from "./review"
@@ -119,6 +120,96 @@ afterAll(async () => { await rm(root, { recursive: true, force: true }) })
 const localExecution = () => readExecutionContext({}, freshBudget(), { fetch: failingFetch }).then((resolved) => resolved.execution)
 const testModelIdentity = () => ({ providerId: "test", modelId: "reviewer" })
 const failingModel = (): never => { throw new Error("the model credential must not load before included changes are proven") }
+
+function trackFixedRepository(reader: GitHubReader, dispose = (fixed: FixedRepository) => fixed.dispose()) {
+  let fixed: FixedRepository | undefined
+  let disposals = 0
+  const github: GitHubReader = {
+    ...reader,
+    async prepareFixedRepository(input) {
+      const prepared = await reader.prepareFixedRepository(input)
+      fixed = prepared
+      return { ...prepared, dispose: () => { disposals++; return dispose(prepared) } }
+    },
+  }
+  return {
+    github,
+    directory: () => {
+      if (fixed === undefined) throw new Error("the test did not acquire a fixed repository")
+      return dirname(fixed.directory)
+    },
+    disposals: () => disposals,
+    cleanup: () => fixed?.dispose(),
+  }
+}
+
+function trackDefectRepository(dispose?: (fixed: FixedRepository) => Promise<void>) {
+  const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, commits.defectSha) } })
+  return trackFixedRepository(createGitHubReader({ GITHUB_TOKEN: "pr-review-token" }, {
+    fetch: api.fetchImpl, gitRemoteUrl: () => origin, clock: manualClock(),
+  }), dispose)
+}
+
+test.each(["normal", "late"] as const)("the fixed repository is gone before a %s worker returns", async (timing) => {
+  const execution = await localExecution()
+  const tracked = trackDefectRepository()
+  let beforeAnalysis: "present" | "missing" | undefined
+  try {
+    const result = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out: join(root, `dispose-${timing}`) }, {
+      github: tracked.github,
+      execution,
+      progress: () => {},
+      model: () => configuration,
+      modelIdentity: testModelIdentity,
+      budget: createBudget(systemClock, 15_000),
+      runWorker: async (input) => {
+        beforeAnalysis = await lstat(tracked.directory()).then(() => "present", () => "missing")
+        if (timing === "late") {
+          if (input.phaseDeadlines === undefined) throw new Error("the late worker requires a kill deadline")
+          await Bun.sleep(Math.max(0, input.phaseDeadlines.workerKillEpochMs + 50 - Date.now()))
+        }
+        return worker()
+      },
+    })
+    expect(tracked.disposals()).toBe(1)
+    await expect(lstat(tracked.directory())).rejects.toMatchObject({ code: "ENOENT" })
+    expect(beforeAnalysis).toBe("missing")
+    expect(result.outcome.kind).toBe("reviewed")
+    if (result.outcome.kind !== "reviewed") throw new Error("unreachable")
+    expect(result.outcome.result.status).toBe("complete")
+    expect(result.outcome.result.issues.map(({ candidate: found }) => found.id)).toEqual([candidate.id])
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(await readFile(join(result.runDirectory, "result.json"), "utf8"))).toEqual(result.outcome.result)
+  } finally {
+    await tracked.cleanup()
+  }
+}, 20_000)
+
+test("an export error disposes the repository once and keeps the primary failure", async () => {
+  const execution = await localExecution()
+  const tracked = trackDefectRepository(async (fixed) => {
+    await fixed.dispose()
+    throw new Error("secondary disposal failure")
+  })
+  const out = join(root, "dispose-export-error")
+  try {
+    const result = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out }, {
+      github: tracked.github,
+      execution,
+      progress: (event) => {
+        if (event.phase === "preparation" && event.event === "start") mkdirSync(join(out, "replay"))
+      },
+      model: failingModel,
+      modelIdentity: testModelIdentity,
+      budget: freshBudget(),
+    })
+    expect(result.outcome).toMatchObject({ kind: "failed", failure: { code: "snapshot-fetch", stage: "preparation", message: "out must be a new directory" } })
+    expect(tracked.disposals()).toBe(1)
+    await expect(lstat(tracked.directory())).rejects.toMatchObject({ code: "ENOENT" })
+  } finally {
+    await tracked.cleanup()
+  }
+})
 
 test("a PR review reproduces the local review over the same fixed objects", async () => {
   const local = await runReview({ repo, base: commits.baseSha, head: commits.defectSha, out: join(root, "local-run") }, { configuration, runWorker: worker })
@@ -581,64 +672,6 @@ test("PR export runs Git in a credential-free environment while the fetch carrie
   await rm(shimRoot, { recursive: true, force: true })
 })
 
-test("a cleanup failure after validated verification keeps the verified work as a red-job partial", async () => {
-  const execution = await localExecution()
-  const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, commits.defectSha) } })
-  const base = createGitHubReader({ GITHUB_TOKEN: "pr-review-token" }, { fetch: api.fetchImpl, gitRemoteUrl: () => origin, clock: manualClock() })
-  const brokenDispose: GitHubReader = {
-    ...base,
-    prepareFixedRepository: async (input) => {
-      const fixed = await base.prepareFixedRepository(input)
-      return {
-        ...fixed,
-        dispose: async () => {
-          await rm(dirname(fixed.directory), { recursive: true, force: true })
-          throw new Error("forced cleanup failure after validated verification")
-        },
-      }
-    },
-  }
-  const outcome = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out: join(root, "dispose-failed") }, {
-    github: brokenDispose,
-    execution,
-    progress: () => {},
-    model: () => configuration,
-    modelIdentity: testModelIdentity,
-    budget: freshBudget(),
-    runWorker: worker,
-  })
-  expect(outcome.outcome.kind).toBe("reviewed")
-  if (outcome.outcome.kind !== "reviewed") throw new Error("unreachable")
-  expect(outcome.outcome.result.status).toBe("partial")
-  expect(outcome.outcome.result.issues).toHaveLength(1)
-  expect(outcome.outcome.result.stageErrors.map((error) => error.code)).toContain("cleanup-failed")
-  expect(outcome.exitCode).toBe(1)
-
-  // A disposal error carrying no text still folds into the partial instead of failing the
-  // contract's message minimum and discarding the verified work.
-  const blankDispose: GitHubReader = {
-    ...base,
-    prepareFixedRepository: async (input) => {
-      const fixed = await base.prepareFixedRepository(input)
-      return { ...fixed, dispose: async () => { throw new Error("") } }
-    },
-  }
-  const blankOutcome = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out: join(root, "dispose-blank") }, {
-    github: blankDispose,
-    execution,
-    progress: () => {},
-    model: () => configuration,
-    modelIdentity: testModelIdentity,
-    budget: freshBudget(),
-    runWorker: worker,
-  })
-  expect(blankOutcome.outcome.kind).toBe("reviewed")
-  if (blankOutcome.outcome.kind !== "reviewed") throw new Error("unreachable")
-  expect(blankOutcome.outcome.result.status).toBe("partial")
-  expect(blankOutcome.outcome.result.issues).toHaveLength(1)
-  expect(blankOutcome.outcome.result.stageErrors.map((error) => error.code)).toContain("cleanup-failed")
-})
-
 test("an all-omitted change reviews without ever loading the model credential", async () => {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "pr-review-omitted-"))
   const spawn = (args: string[]): string => {
@@ -904,6 +937,11 @@ test("a real hung worker finishes inside the run budget and exports no sentinels
   // stalled on a loopback provider. The run must end inside its budget with the process group
   // gone, and no sentinel credential may survive into the replay export.
   const stallRoot = await mkdtemp(join(tmpdir(), "pr-review-stall-"))
+  const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, commits.defectSha) } })
+  const tracked = trackFixedRepository(createGitHubReader({ GITHUB_TOKEN: "pr-review-sentinel-token" }, {
+    fetch: api.fetchImpl,
+    gitRemoteUrl: () => origin,
+  }))
   let requests = 0
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => {
     requests++
@@ -912,14 +950,9 @@ test("a real hung worker finishes inside the run budget and exports no sentinels
   const out = join(root, "real-hung-worker")
   try {
     const execution = await localExecution()
-    const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, commits.defectSha) } })
-    const github = createGitHubReader({ GITHUB_TOKEN: "pr-review-sentinel-token" }, {
-      fetch: api.fetchImpl,
-      gitRemoteUrl: () => origin,
-    })
     const started = Date.now()
     const outcome = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out }, {
-      github,
+      github: tracked.github,
       execution,
       progress: () => {},
       model: () => ({
@@ -938,6 +971,8 @@ test("a real hung worker finishes inside the run budget and exports no sentinels
     expect(outcome.outcome.failure.stage).toBe("discovery")
     // The run finished inside its own budget even though the provider never answered.
     expect(elapsed).toBeLessThan(25_000)
+    expect(tracked.disposals()).toBe(1)
+    await expect(lstat(tracked.directory())).rejects.toMatchObject({ code: "ENOENT" })
     const scan = async (directory: string): Promise<void> => {
       for (const entry of await readdir(directory, { withFileTypes: true })) {
         const path = join(directory, entry.name)
@@ -951,6 +986,7 @@ test("a real hung worker finishes inside the run budget and exports no sentinels
     }
     await scan(outcome.runDirectory)
   } finally {
+    await tracked.cleanup()
     await server.stop(true)
     await rm(stallRoot, { recursive: true, force: true })
   }
@@ -1075,34 +1111,35 @@ test("a cleanup failure after validated verification retains the verifications i
   expect(JSON.parse(await readFile(join(outcome.runDirectory, "result.json"), "utf8"))).toEqual(outcome.outcome.result)
 })
 
-test("a hanging fixed-repository cleanup is abandoned at the run deadline and the analysis survives", async () => {
+test.each(["rejected", "blank", "hanging"] as const)("%s fixed-repository disposal retains the verified work as a red partial", async (mode) => {
   const execution = await localExecution()
-  const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, commits.defectSha) } })
-  const base = createGitHubReader({ GITHUB_TOKEN: "pr-review-token" }, { fetch: api.fetchImpl, gitRemoteUrl: () => origin, clock: manualClock() })
-  const hangingDispose: GitHubReader = {
-    ...base,
-    prepareFixedRepository: async (input) => {
-      const fixed = await base.prepareFixedRepository(input)
-      return { ...fixed, dispose: () => new Promise<void>(() => {}) }
-    },
-  }
-  const started = Date.now()
-  const outcome = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out: join(root, "dispose-hang") }, {
-    github: hangingDispose,
-    execution,
-    progress: () => {},
-    model: () => configuration,
-    modelIdentity: testModelIdentity,
-    budget: createBudget(systemClock, 15_000),
-    runWorker: worker,
+  const tracked = trackDefectRepository(async (fixed) => {
+    await fixed.dispose()
+    if (mode === "hanging") return new Promise<void>(() => {})
+    throw new Error(mode === "blank" ? "" : "fixed repository disposal failed")
   })
-  // The run finishes inside its own budget even though cleanup never returns, and the validated
-  // analysis survives as a partial carrying the cleanup failure.
-  expect(Date.now() - started).toBeLessThan(20_000)
-  expect(outcome.outcome.kind).toBe("reviewed")
-  if (outcome.outcome.kind !== "reviewed") throw new Error("unreachable")
-  expect(outcome.outcome.result.status).toBe("partial")
-  expect(outcome.outcome.result.stageErrors.map((error) => error.code)).toContain("cleanup-failed")
-  expect(outcome.outcome.result.issues).toHaveLength(1)
-  expect(outcome.exitCode).toBe(1)
-}, 40_000)
+  try {
+    const started = Date.now()
+    const outcome = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out: join(root, `dispose-${mode}`) }, {
+      github: tracked.github,
+      execution,
+      progress: () => {},
+      model: () => configuration,
+      modelIdentity: testModelIdentity,
+      budget: createBudget(systemClock, 15_000),
+      runWorker: worker,
+    })
+    expect(Date.now() - started).toBeLessThan(5_000)
+    expect(tracked.disposals()).toBe(1)
+    await expect(lstat(tracked.directory())).rejects.toMatchObject({ code: "ENOENT" })
+    expect(outcome.outcome.kind).toBe("reviewed")
+    if (outcome.outcome.kind !== "reviewed") throw new Error("unreachable")
+    expect(outcome.outcome.result.status).toBe("partial")
+    expect(outcome.outcome.result.stageErrors).toMatchObject([{ code: "cleanup-failed", stage: "cleanup" }])
+    expect(outcome.outcome.result.issues).toHaveLength(1)
+    expect(outcome.exitCode).toBe(1)
+    expect(JSON.parse(await readFile(join(outcome.runDirectory, "result.json"), "utf8"))).toEqual(outcome.outcome.result)
+  } finally {
+    await tracked.cleanup()
+  }
+}, 20_000)

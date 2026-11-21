@@ -139,6 +139,10 @@ export const runtimeResultSchema = z.discriminatedUnion("status", [
     code: failureCodeSchema,
   }),
 ])
+export const workerProgressSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("running"), record: z.strictObject(runCommon) }),
+  z.strictObject({ kind: z.literal("terminal"), record: runtimeResultSchema }),
+])
 
 export type ReadLimits = z.infer<typeof readLimitsSchema>
 export type ReadRecord = z.infer<typeof readRecordSchema>
@@ -147,6 +151,7 @@ export type ModelConfiguration = z.infer<typeof modelSchema>
 export type WorkerInput = z.infer<typeof workerInputSchema>
 export type PhaseValidation = z.infer<typeof phaseValidationSchema>
 export type RuntimeResult = z.infer<typeof runtimeResultSchema>
+export type WorkerProgress = z.infer<typeof workerProgressSchema>
 export type PhaseResult = z.infer<typeof phaseResultSchema>
 export type Usage = z.infer<typeof usageSchema>
 export const defaultReadLimits: ReadLimits = readLimitsSchema.parse({})

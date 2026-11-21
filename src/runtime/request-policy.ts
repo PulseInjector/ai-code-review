@@ -7,9 +7,6 @@ export const MODEL_ADMISSION_MS = 2_000
 export const modelTransportFetch = (input: RequestInfo | URL, init?: RequestInit) =>
   fetch(input, { ...init, redirect: "manual", keepalive: false })
 const RETRY_DELAYS_MS = [1_000, 2_000] as const
-// A logical model call never exceeds three attempts on the wire. The retry hook enforces the cap
-// for kinds that pass through it by refusing an attempt ordinal above three; http.request enforces
-// it for every other path, including the SDK's internal retry loops that bypass the retry hook.
 const MAX_ATTEMPTS = 3
 const RETRIABLE_STATUSES = new Set([429, 500, 502, 503, 504, 529])
 const RETRIABLE_ERROR_TYPES = new Set(["provider.rate-limit", "provider.transport", "provider.timeout"])
@@ -90,8 +87,7 @@ export function createRequestPolicyPlugin(options: {
   }
   const modelHook = (event: { sessionID: string; kind: RequestRecord["kind"] }): void => {
     const slot = slotFor(event.sessionID, event.kind)
-    // The pinned SDK prepares each primary attempt anew; its retry callback reserves the ordinal
-    // before that preparation. Generate's internal retry loop reuses the prepared call.
+    // The SDK prepares each primary attempt anew. Keep the slot when the retry hook authorized it.
     if (!slot.retrying) {
       slot.lastAttempt = 0
       delete slot.record
@@ -100,6 +96,10 @@ export function createRequestPolicyPlugin(options: {
   }
 
   const requestHook = (event: { sessionID: string; kind: RequestRecord["kind"]; request: unknown }): void => {
+    // Session generate bypasses the retry hook in 2.2.7. Review uses primary sessions instead.
+    if (event.kind === "generate") {
+      stopRequest(event, "model-config", "standalone model generation is not supported by the review runtime")
+    }
     const state = phase()
     const slot = slotFor(event.sessionID, event.kind)
     const attempt = slot.lastAttempt + 1
@@ -108,6 +108,9 @@ export function createRequestPolicyPlugin(options: {
     }
     if (now() + MODEL_ADMISSION_MS > state.deadlineEpochMs) {
       stopRequest(event, stageTimeoutCode(state.phase), "the active phase deadline stops a new model request")
+    }
+    if (attempt > 1 && !slot.retrying) {
+      stopRequest(event, "model-format", "a model retry requires approval from the session retry hook")
     }
     if (ledger.records.length >= REQUEST_LEDGER_CAP) {
       ledger.capped = true

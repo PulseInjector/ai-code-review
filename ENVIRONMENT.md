@@ -10,9 +10,15 @@
 The project uses the pinned OpenCode SDK and its embedded host API. A separately installed OpenCode CLI is not required.
 
 The review runtime disables model HTTP redirects, optional title generation,
-and background compaction. Each logical model call can send at most three
-requests. If the prompt response is lost, the worker checks the original
-session for the prompt and never resubmits it.
+and background compaction. Primary review calls and foreground compaction
+can send up to three requests per call. Only transient failures can retry.
+Retries wait 1,000 ms and 2,000 ms respectively, or longer if `Retry-After`
+requires it. Each send needs at least 2,000 ms left in the phase.
+
+The runtime blocks standalone `sessions.generate` before it contacts the
+provider. Review does not use it, and OpenCode 2.2.7 does not expose a retry
+hook for that call. If the prompt response is lost, the worker checks the
+original session for the prompt and never resubmits it.
 
 ## Install and Check
 

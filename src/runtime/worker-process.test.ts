@@ -4,7 +4,20 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { z } from "zod"
 import { runIsolatedWorker } from "./worker-process"
-import { runtimeFailure } from "./contracts"
+import { deadlineClock } from "../budget"
+import { runtimeFailure, workerProgressSchema, type RuntimeResult } from "./contracts"
+
+function modelResponse(text: string) {
+  const chunk = (delta: { content?: string }, finishReason: string | null) => `data: ${JSON.stringify({
+    id: "test-turn", object: "chat.completion.chunk", created: 0, model: "test-model",
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })}\n\n`
+  return new Response(chunk({ content: text }, null) + chunk({}, "stop") + "data: [DONE]\n\n", {
+    headers: { "content-type": "text/event-stream" },
+  })
+}
+
+const workerPath = join(import.meta.dir, "worker.ts")
 
 test("a stalled model worker exits within the parent deadline and retains unknown usage", async () => {
   const root = await mkdtemp(join(tmpdir(), "review-timeout-"))
@@ -51,6 +64,166 @@ test("a stalled model worker exits within the parent deadline and retains unknow
     await rm(root, { recursive: true, force: true })
   }
 }, 15_000)
+
+for (const conflictingFinal of [false, true]) {
+  test(`forced cleanup preserves a legacy verification failure ${conflictingFinal ? "over a newer timeout result" : "without a final result"}`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-hung-terminal-"))
+    const material = join(root, "material")
+    const script = join(root, "worker.ts")
+    const started = Date.now()
+    const phaseDeadlines = { prepareInitEpochMs: started + 900, discoveryEpochMs: null, analysisStopEpochMs: started + 1_000, workerKillEpochMs: started + 1_300, finalEpochMs: started + 3_000 }
+    const usage = { kind: "known", inputTokens: 11, outputTokens: 7 } as const
+    const progress = {
+      ...runtimeFailure("runtime is in progress", "interrupted", false, "run-interrupted"),
+      checkpointSequence: 4, usage, phaseDeadlines,
+      sessions: [
+        { name: "discover", status: "complete", text: '{"candidates":[]}', usage },
+        { name: "verify", status: "failed", code: "model-auth", error: "invalid model key", usage },
+      ],
+    } satisfies RuntimeResult
+    const final = { ...runtimeFailure("late timeout", "timeout", false, "verification-timeout"), checkpointSequence: 5, phaseDeadlines }
+    try {
+      await mkdir(material)
+      await writeFile(script, `
+import { writeFileSync } from "node:fs"
+process.on("SIGINT", () => {})
+writeFileSync(process.argv[3] + ".progress.json", ${JSON.stringify(JSON.stringify(progress))})
+${conflictingFinal ? `writeFileSync(process.argv[3], ${JSON.stringify(JSON.stringify(final))})` : ""}
+setInterval(() => {}, 1_000)
+`)
+      const result = await runIsolatedWorker({
+        runDirectory: root, materialDirectory: material, apiKey: "test-key", phaseDeadlines,
+        model: { providerID: "test", modelID: "hung", baseURL: "http://127.0.0.1:9/v1" },
+        prompts: [{ name: "discover", text: "Discover" }, { name: "verify", text: "Verify" }],
+      }, { workerPath: script, clock: deadlineClock })
+      expect(result).toMatchObject({
+        status: "failed", code: "model-auth", error: "invalid model key", sessions: progress.sessions,
+        cleanup: { forced: true, hostClosed: false }, usage: { kind: "unknown" },
+      })
+    } finally { await rm(root, { recursive: true, force: true }) }
+  }, 5_000)
+}
+
+test("an SDK discovery response completed after its deadline never starts verification", async () => {
+  const root = await mkdtemp(join(tmpdir(), "review-late-discovery-"))
+  const material = join(root, "material")
+  const jump = join(root, "advance-clock")
+  const requests: string[] = []
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const body = await request.text()
+    const verifying = body.includes("Verification phase")
+    requests.push(verifying ? "verify" : "discover")
+    if (!verifying) await writeFile(jump, "")
+    return modelResponse(verifying ? '{"verifications":[]}' : '{"candidates":[]}')
+  } })
+  try {
+    await mkdir(material)
+    const script = join(root, "clock-worker.ts")
+    await writeFile(script, `
+import { existsSync } from "node:fs"
+const realNow = Date.now
+Date.now = () => realNow() + (existsSync(${JSON.stringify(jump)}) ? 121_000 : 0)
+await import(${JSON.stringify(workerPath)})
+`)
+    const result = await runIsolatedWorker({
+      runDirectory: root, materialDirectory: material, apiKey: "late-model-key",
+      model: { providerID: "test", modelID: "test-model", baseURL: `http://127.0.0.1:${server.port}/v1` },
+      prompts: [{ name: "discover", text: "Discovery phase" }, { name: "verify", text: "Verification phase" }],
+      phaseValidation: { changedHeadPaths: [], includedFiles: [] },
+    }, { workerPath: script, clock: deadlineClock })
+    expect(requests).toEqual(["discover"])
+    expect(result).toMatchObject({ status: "timeout", code: "discovery-timeout", sessions: [{ name: "discover", status: "timeout" }] })
+    expect(result.sessions.some((session) => "text" in session)).toBe(false)
+  } finally {
+    await server.stop(true)
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
+
+for (const [phase, late] of [["discover", true], ["verify", true], ["verify", false]] as const) {
+  test(late ? `late ${phase} citation validation does not publish the phase text` : "on-time verification survives a stale discovery signal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-late-validation-"))
+    const material = join(root, "material")
+    const head = join(material, "head")
+    const evidencePath = join(head, "evidence.txt")
+    const ready = join(root, "validation-started")
+    const release = join(root, "release-validation")
+    const jump = join(root, "advance-clock")
+    const script = join(root, "clock-worker.ts")
+    const started = Date.now()
+    const phaseDeadlines = { prepareInitEpochMs: started + 5_000, discoveryEpochMs: null, analysisStopEpochMs: started + 10_000, workerKillEpochMs: started + 11_000, finalEpochMs: started + 12_000 }
+    const location = { side: "head", path: "change.txt", startLine: 1, endLine: 1, excerpt: "change" } as const
+    const evidence = { ...location, path: "evidence.txt", excerpt: "evidence" }
+    const discovery = JSON.stringify({ candidates: [{ id: "C-1", changeLocation: location, trigger: "trigger", consequence: "consequence", rootCause: "cause", citations: [phase === "discover" ? evidence : location] }] })
+    const verification = JSON.stringify({ verifications: [{ candidateId: "C-1", decision: "keep", reason: "reason", evidence: [evidence] }] })
+    const requests: string[] = []
+    const writers: Bun.Subprocess[] = []
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      const verifying = (await request.text()).includes("Verification phase")
+      const active = verifying ? "verify" : "discover"
+      requests.push(active)
+      if (active === phase && writers.length === 0) {
+        // The isolated snapshot was already checked. The writer can open the FIFO only once
+        // real citation validation opens its reader.
+        expect(Bun.spawnSync(["mkfifo", evidencePath]).exitCode).toBe(0)
+        writers.push(Bun.spawn([process.execPath, "-e", `
+import { closeSync, existsSync, openSync, writeFileSync, writeSync } from "node:fs"
+const fd = openSync(${JSON.stringify(evidencePath)}, "w")
+writeFileSync(${JSON.stringify(ready)}, "")
+while (!existsSync(${JSON.stringify(release)})) await Bun.sleep(10)
+writeSync(fd, "evidence\\n")
+closeSync(fd)
+`], { stdout: "ignore", stderr: "ignore" }))
+      }
+      return modelResponse(verifying ? verification : discovery)
+    } })
+    let pending: Promise<RuntimeResult> | undefined
+    try {
+      await mkdir(head, { recursive: true })
+      await writeFile(join(head, location.path), "change\n")
+      await writeFile(script, `
+import { existsSync } from "node:fs"
+const realNow = Date.now
+Date.now = () => realNow() + (existsSync(${JSON.stringify(jump)}) ? 12_000 : 0)
+await import(${JSON.stringify(workerPath)})
+`)
+      pending = runIsolatedWorker({
+        runDirectory: root, materialDirectory: material, apiKey: "late-validation-key", phaseDeadlines,
+        model: { providerID: "test", modelID: "test-model", baseURL: `http://127.0.0.1:${server.port}/v1` },
+        prompts: [{ name: "discover", text: "Discovery phase" }, { name: "verify", text: "Verification phase" }],
+        phaseValidation: { changedHeadPaths: [location.path], includedFiles: [location, evidence].map(({ side, path }) => ({ side, path })) },
+      }, { workerPath: script, clock: deadlineClock })
+      for (let attempt = 0; attempt < 350 && !await Bun.file(ready).exists(); attempt++) await Bun.sleep(20)
+      expect(await Bun.file(ready).exists()).toBe(true)
+      const progress = workerProgressSchema.parse(JSON.parse(await readFile(join(root, "runtime/result.json.progress.json"), "utf8")))
+      expect(progress.kind).toBe("running")
+      expect(progress.record.sessions.map(({ name }) => name)).toEqual(phase === "discover" ? [] : ["discover"])
+      if (late) await writeFile(jump, "")
+      else {
+        const { pid } = z.object({ pid: z.int().positive() }).parse(JSON.parse(await readFile(join(root, "runtime/process.json"), "utf8")))
+        process.kill(pid, "SIGUSR2")
+      }
+      await writeFile(release, "")
+      const result = await pending
+      if (late) {
+        expect(result).toMatchObject({ status: "timeout", code: phase === "discover" ? "discovery-timeout" : "verification-timeout" })
+        const unsettled = result.sessions.at(-1)
+        expect(unsettled).toMatchObject({ name: phase, status: "timeout" })
+        expect(unsettled).not.toHaveProperty("text")
+      } else {
+        expect(result).toMatchObject({ status: "complete", cleanup: { hostClosed: true, forced: false } })
+        expect(result.sessions.at(-1)).toMatchObject({ name: "verify", status: "complete", text: verification })
+      }
+      expect(requests).toEqual(phase === "discover" ? ["discover"] : ["discover", "verify"])
+    } finally {
+      for (const writer of writers) writer.kill("SIGKILL")
+      await Promise.all(writers.map(({ exited }) => exited))
+      await pending?.catch(() => undefined)
+      await server.stop(true)
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+}
 
 // The installed SDK runs its model server in-process, so a stalled worker spawns no descendant of
 // its own. The group-kill guarantee the parent relies on still has to cover any descendant a

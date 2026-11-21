@@ -7,7 +7,7 @@ import { GitHubError, credentialFreeGitEnvironment, type FixedRepository, type G
 import { runReview, type ReviewRun } from "./review"
 import { loadModelConfiguration } from "./runtime/worker-process"
 import type { DiscoveryWorker } from "./discovery"
-import { BudgetExhaustedError, withinDeadline, withinStage, workerPhaseDeadlines, WORKER_KILL_RESERVE_MS, type DeadlineResult } from "./budget"
+import { BudgetExhaustedError, withinDeadline, withinStage } from "./budget"
 import {
   phaseCheckpointSchema, prReviewResultSchema, recoverableFailureCodes, reduceTerminalReview,
   type Execution, type Failure, type PhaseCheckpoint, type PrOutcome, type PrReviewResult, type PullRequestIdentity,
@@ -18,6 +18,7 @@ import type { ExecutionBudget } from "./budget"
 import type { ProgressEvent, ProgressSink } from "./progress"
 
 const BACKUP_BODY_BYTE_LIMIT = 60_000
+const FIXED_REPOSITORY_DISPOSAL_MS = 1_000
 const sha256 = (value: string | Uint8Array): Sha256 => createHash("sha256").update(value).digest("hex") as Sha256
 // Every failure message must satisfy the contract's one-line minimum, so an error carrying no
 // usable text still becomes a bounded, nonempty diagnostic instead of a schema violation.
@@ -390,35 +391,38 @@ export async function runPrReview(command: PrReviewCommand, deps: PrReviewDepend
     }
   }
 
+  // Start removal even when preparation has expired. Only the wait is bounded, and a late
+  // completion or failure must not hold up model analysis or consume the final write reserve.
+  let disposal: Promise<Failure | null> | undefined
+  const disposeFixedRepository = (fixed: FixedRepository): Promise<Failure | null> => disposal ??= (async () => {
+    const deadline = Date.now() + Math.min(FIXED_REPOSITORY_DISPOSAL_MS, deps.budget.stageRemainingMs("prepare-init"))
+    const removal = Promise.resolve().then(() => fixed.dispose()).then(
+      () => null,
+      (error): Failure => ({ code: "cleanup-failed", stage: "cleanup", message: boundedMessage(error) }),
+    )
+    const result = await withinDeadline(() => removal, deadline)
+    return result.kind === "completed" ? result.value
+      : { code: "cleanup-failed", stage: "cleanup", message: "fixed repository cleanup exceeded its deadline" }
+  })()
+
   let fixed: FixedRepository
+  let acquired: FixedRepository | undefined
   try {
     const capturedPr = captured
     fixed = await withinStage(deps.budget, "prepare-init", async (signal) => {
       const prepared = await deps.github.prepareFixedRepository({ captured: capturedPr, configPath: command.config, budget: deps.budget })
-      if (signal.aborted || !deps.budget.canStartRequest("prepare-init", 1)) {
-        void prepared.dispose().catch(() => undefined)
-        deps.budget.assertRemaining("prepare-init")
-        signal.throwIfAborted()
-      }
+      acquired = prepared
+      if (signal.aborted) void disposeFixedRepository(prepared)
       return prepared
     })
     configSource = fixed.configSource
   } catch (error) {
+    if (acquired !== undefined) await disposeFixedRepository(acquired)
     return failureOutcome(classifyPreparationError(error), out, false)
   }
 
   let run: ReviewRun
   let disposeFailure: Failure | null = null
-  // The parent boundary enforces the final deadline: fixed-repository cleanup after analysis is
-  // bounded by the run deadline, so a hung directory removal cannot carry the run past its
-  // budget, and the failure is recorded separately instead of discarding the analysis.
-  const finalEpochMs = workerPhaseDeadlines(deps.budget).finalEpochMs
-  const disposalDeadline = finalEpochMs - WORKER_KILL_RESERVE_MS
-  let disposal: Promise<DeadlineResult<void>> | undefined
-  const disposeFixedRepository = async (): Promise<void> => {
-    disposal ??= withinDeadline(() => fixed.dispose(), disposalDeadline)
-    if ((await disposal).kind === "timed-out") throw new Error("fixed repository cleanup exceeded the run deadline")
-  }
   let terminalOutcome: PrOutcome | undefined
   try {
     // runReview receives the replay subdirectory, never <out> itself, the budget owns its
@@ -433,9 +437,10 @@ export async function runPrReview(command: PrReviewCommand, deps: PrReviewDepend
         progress: reviewProgress,
         getModelConfiguration: deps.model,
         gitEnvironment: credentialFreeGitEnvironment(),
+        afterExport: async () => {
+          disposeFailure = await disposeFixedRepository(fixed)
+        },
         finalizeReplay: async (preparedRun, signal) => {
-          try { await disposeFixedRepository() }
-          catch (error) { disposeFailure = { code: "cleanup-failed", stage: "cleanup", message: boundedMessage(error) } }
           signal.throwIfAborted()
           const outcome = reducePrRun(preparedRun, deps.execution, disposeFailure)
           terminalOutcome = outcome
@@ -450,11 +455,7 @@ export async function runPrReview(command: PrReviewCommand, deps: PrReviewDepend
       },
     )
   } catch (error) {
-    try {
-      await disposeFixedRepository()
-    } catch {
-      // The primary preparation failure already decides this outcome.
-    }
+    await disposeFixedRepository(fixed)
     if (terminalOutcome === undefined) return failureOutcome(classifyPreparationError(error), out, false)
     return failureOutcome({ code: "artifact-write", stage: "handoff", message: boundedMessage(error) }, out, false)
   }
@@ -519,8 +520,7 @@ function reducePrRun(run: ReviewRun, execution: Execution, disposeFailure: Failu
       outcome = { kind: "failed", failure: runtimeFailureData?.failure ?? failureFromLocalResult(result), snapshot: result.snapshot }
     }
   } else {
-    // A disposal failure after fully validated analysis folds into terminal assembly: the
-    // verified work stays as a partial with retained keeps, and the red-job stage error rides it.
+    // Keep verified findings as a red partial when repository disposal failed before analysis.
     const assembled = prResultFromRun(run)
     const resultForReduction = disposeFailure !== null
       ? prReviewResultSchema.parse({ ...assembled, status: "partial" })
