@@ -44,6 +44,7 @@ function runtimeResult(discoveryText: string, verificationText: string): Runtime
     usage: { kind: "known", inputTokens: 20, outputTokens: 20 },
     readBudget: { consumedBytes: 0, truncated: false, exhausted: false, records: [] },
     cleanup: { hostClosed: true, forced: false },
+    checkpointSequence: 1, submission: { kind: "not-submitted" }, requests: { records: [], capped: false }, phaseDeadlines: null,
   }
 }
 
@@ -99,5 +100,20 @@ test("rejects citations that do not match an included snapshot line", async () =
     const output = runtimeResult(JSON.stringify({ candidates: [invalid] }), JSON.stringify({ verifications: [] }))
     await expect(runDiscoveryAndVerification(options(state.context, state.materialDirectory, state.root, mockWorker(output))))
       .rejects.toThrow("citation excerpt does not match")
+  } finally { await rm(state.root, { recursive: true, force: true }) }
+})
+
+test("the parent aborts a worker adapter that never settles", async () => {
+  const state = await fixture()
+  try {
+    let workerSignal: AbortSignal | undefined
+    const hung: DiscoveryWorker = async (_, signal) => {
+      workerSignal = signal
+      return new Promise(() => {})
+    }
+    await expect(runDiscoveryAndVerification({
+      ...options(state.context, state.materialDirectory, state.root, hung), timeoutMs: 100,
+    })).rejects.toMatchObject({ failure: { code: "discovery-timeout" }, checkpoint: { kind: "none" } })
+    expect(workerSignal?.aborted).toBe(true)
   } finally { await rm(state.root, { recursive: true, force: true }) }
 })

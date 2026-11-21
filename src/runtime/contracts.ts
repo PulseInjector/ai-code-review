@@ -1,7 +1,67 @@
 import { isAbsolute } from "node:path"
 import { z } from "zod"
+import { digestSchema, instantSchema } from "../identity"
+import { failureCodeSchema } from "../pr-contracts"
 
 const absolutePath = z.string().min(1).refine(isAbsolute, "expected an absolute path")
+// The parent and the worker share one absolute phase plan on wall-clock epochs, so the worker's
+// request admission and the parent's interrupt timers agree on the same instants. Discovery has
+// no deadline until it starts; the worker records the start and echoes the concrete value back
+// through its progress record.
+export const phaseDeadlinesSchema = z.strictObject({
+  prepareInitEpochMs: z.int().positive(),
+  discoveryEpochMs: z.int().positive().nullable(),
+  analysisStopEpochMs: z.int().positive(),
+  workerKillEpochMs: z.int().positive(),
+  finalEpochMs: z.int().positive(),
+}).refine((deadlines) =>
+  deadlines.prepareInitEpochMs <= deadlines.analysisStopEpochMs &&
+  deadlines.analysisStopEpochMs <= deadlines.workerKillEpochMs &&
+  deadlines.workerKillEpochMs < deadlines.finalEpochMs,
+"phase deadlines must be ordered preparation, analysis stop, worker kill, and final")
+export type PhaseDeadlines = z.infer<typeof phaseDeadlinesSchema>
+export type PhaseKind = "initialization" | "discovery" | "verification"
+export const submissionSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("not-submitted") }),
+  z.strictObject({
+    kind: z.literal("submitting"),
+    sessionId: z.string().min(1).max(256),
+    baselineUserIds: z.array(z.string().min(1)),
+    promptDigest: digestSchema,
+    submittedAt: instantSchema,
+  }),
+  z.strictObject({
+    kind: z.literal("accepted"),
+    sessionId: z.string().min(1).max(256),
+    userMessageId: z.string().min(1),
+    promptDigest: digestSchema,
+  }),
+  z.strictObject({
+    kind: z.literal("acceptance-unknown"),
+    sessionId: z.string().min(1).max(256),
+    promptDigest: digestSchema,
+  }),
+])
+export type Submission = z.infer<typeof submissionSchema>
+export const requestRecordSchema = z.strictObject({
+  sequence: z.int().positive(),
+  phase: z.enum(["initialization", "discovery", "verification"]),
+  sessionId: z.string().min(1).max(256),
+  kind: z.enum(["primary", "compaction", "title", "generate"]),
+  attempt: z.int().min(1).max(3),
+  startedAt: instantSchema,
+  finishedAt: instantSchema.nullable(),
+  status: z.int().min(100).max(599).nullable(),
+  outcome: z.enum(["started", "response", "transport-error", "unknown"]),
+})
+export const REQUEST_LEDGER_CAP = 256
+export const requestLedgerSchema = z.strictObject({
+  records: z.array(requestRecordSchema).max(REQUEST_LEDGER_CAP),
+  capped: z.boolean(),
+})
+export type RequestRecord = z.infer<typeof requestRecordSchema>
+export type RequestLedger = z.infer<typeof requestLedgerSchema>
+export const emptyRequestLedger = (): RequestLedger => ({ records: [], capped: false })
 export const readLimitsSchema = z.strictObject({
   perToolBytes: z.int().min(256).max(32 * 1024).default(32 * 1024),
   totalBytes: z.int().min(256).max(512 * 1024).default(512 * 1024),
@@ -24,7 +84,7 @@ export const workerInputSchema = z.strictObject({
   model: modelSchema,
   materialDirectory: absolutePath,
   configDirectory: absolutePath,
-  deadline: z.int().positive(),
+  phaseDeadlines: phaseDeadlinesSchema,
   readLimits: readLimitsSchema,
   prompts: z.array(promptSchema).min(1).max(2),
   phaseValidation: phaseValidationSchema.optional(),
@@ -46,15 +106,38 @@ export const readBudgetSchema = z.strictObject({
 const phaseCommon = { name: z.string(), sessionID: z.string().optional(), usage: usageSchema, durationMs: z.int().nonnegative().optional() }
 export const phaseResultSchema = z.discriminatedUnion("status", [
   z.strictObject({ ...phaseCommon, status: z.literal("complete"), text: z.string().min(1).max(256 * 1024) }),
-  z.strictObject({ ...phaseCommon, status: z.enum(["failed", "interrupted", "timeout", "read-budget-exhausted"]), error: z.string().min(1) }),
+  // The typed code is the authoritative terminal classification. The parent never pattern-matches
+  // a runtime failure out of its message when this field is present.
+  z.strictObject({
+    ...phaseCommon,
+    status: z.enum(["failed", "interrupted", "timeout", "read-budget-exhausted"]),
+    error: z.string().min(1),
+    code: failureCodeSchema,
+  }),
 ])
 const runCommon = {
   sessions: z.array(phaseResultSchema), usage: usageSchema, readBudget: readBudgetSchema,
-  cleanup: z.strictObject({ hostClosed: z.boolean(), forced: z.boolean() }),
+  // A close failure is recorded beside the primary terminal outcome instead of replacing it, so
+  // an outright model failure keeps its own code and a clean run keeps its settled usage.
+  cleanup: z.strictObject({ hostClosed: z.boolean(), forced: z.boolean(), closeFailure: z.string().min(1).max(2_000).optional() }),
+  // The progress record is one atomic file, so a monotonically increasing sequence inside each
+  // written value lets the parent prove which complete record is the latest.
+  checkpointSequence: z.int().nonnegative(),
+  submission: submissionSchema,
+  requests: requestLedgerSchema,
+  // The progress record always echoes the concrete phase deadlines, including the discovery
+  // deadline once discovery starts. A fallback result built before the worker reported anything
+  // carries null rather than inventing deadlines.
+  phaseDeadlines: phaseDeadlinesSchema.nullable(),
 }
 export const runtimeResultSchema = z.discriminatedUnion("status", [
   z.strictObject({ ...runCommon, status: z.literal("complete") }),
-  z.strictObject({ ...runCommon, status: z.enum(["failed", "interrupted", "timeout", "read-budget-exhausted"]), error: z.string().min(1) }),
+  z.strictObject({
+    ...runCommon,
+    status: z.enum(["failed", "interrupted", "timeout", "read-budget-exhausted"]),
+    error: z.string().min(1),
+    code: failureCodeSchema,
+  }),
 ])
 
 export type ReadLimits = z.infer<typeof readLimitsSchema>
@@ -81,6 +164,15 @@ export function sumUsage(sessions: PhaseResult[]): Usage {
   return { kind: "known", inputTokens, outputTokens }
 }
 
-export function runtimeFailure(error: string, status: "failed" | "timeout" | "interrupted" = "failed", forced = false): RuntimeResult {
-  return { status, error, sessions: [], usage: unknownUsage("worker usage was not settled"), readBudget: emptyReadBudget(), cleanup: { hostClosed: false, forced } }
+export function runtimeFailure(
+  error: string,
+  status: "failed" | "timeout" | "interrupted" = "failed",
+  forced = false,
+  code: z.infer<typeof failureCodeSchema> = "runtime-init",
+): RuntimeResult {
+  return {
+    status, error, code, sessions: [], usage: unknownUsage("worker usage was not settled"),
+    readBudget: emptyReadBudget(), cleanup: { hostClosed: false, forced },
+    checkpointSequence: 0, submission: { kind: "not-submitted" }, requests: emptyRequestLedger(), phaseDeadlines: null,
+  }
 }

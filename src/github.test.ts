@@ -177,17 +177,21 @@ function capture(fixture: RepositoryFixture): PullRequestCapture {
   }
 }
 
-test("the budget admits stages while time remains and rejects exhausted stages", () => {
+test("the budget admits preparation while time remains and rejects exhausted stages", () => {
   const clock = manualClock()
   const executionBudget = createBudget(clock, 300_000)
   expect(executionBudget.remainingMs()).toBe(300_000)
-  expect(executionBudget.stageDeadline("discovery")).toBe(300_000)
-  expect(executionBudget.canStartRequest("discovery", 2_000)).toBe(true)
-  executionBudget.assertRemaining("discovery")
-  clock.advance(299_999)
-  expect(executionBudget.canStartRequest("discovery", 2_000)).toBe(false)
-  expect(executionBudget.canStartRequest("discovery", 0)).toBe(true)
-  executionBudget.assertRemaining("cleanup")
+  expect(executionBudget.canStartRequest("prepare-init", 2_000)).toBe(true)
+  executionBudget.assertRemaining("prepare-init")
+  clock.advance(59_999)
+  expect(executionBudget.canStartRequest("prepare-init", 0)).toBe(true)
+  executionBudget.assertRemaining("prepare-init")
+  clock.advance(1)
+  expect(executionBudget.canStartRequest("prepare-init", 0)).toBe(false)
+  expect(() => executionBudget.assertRemaining("prepare-init")).toThrow(BudgetExhaustedError)
+  expect(executionBudget.canStartRequest("verification", 2_000)).toBe(true)
+  clock.advance(239_999)
+  expect(executionBudget.canStartRequest("cleanup", 0)).toBe(true)
   clock.advance(1)
   expect(() => executionBudget.assertRemaining("cleanup")).toThrow(BudgetExhaustedError)
 })
@@ -311,11 +315,48 @@ test("retry delays honor Retry-After as a lower bound and stop when they cannot 
   const shortClock = manualClock()
   const shortBudget = budget(shortClock)
   shortClock.advance(299_000)
+  // The publish stage runs to the total deadline, so this call is still admitted while almost no
+  // budget remains, and a delay that cannot fit reports the rate limit without a sleep.
   await expectGitHubError(
-    reader({ fetchImpl: delayed, clock: shortClock }).readWorkflow({ repository: REPOSITORY, runId: "987654321", budget: shortBudget }),
+    reader({ fetchImpl: delayed, clock: shortClock }).readWorkflow({ repository: REPOSITORY, runId: "987654321", budget: shortBudget, stage: "publish" }),
     "github-rate-limit",
   )
   expect(shortClock.sleeps).toEqual([])
+})
+
+test("a prepare-init request is refused once the preparation cap is spent even with total budget left", async () => {
+  const clock = manualClock()
+  const spent = budget(clock)
+  clock.advance(60_000)
+  const never: FetchLike = async (input) => { throw new Error(`the request must not be sent: ${String(input)}`) }
+  await expectGitHubError(
+    reader({ fetchImpl: never, clock }).capturePullRequest({ repository: REPOSITORY, pr: 17, budget: spent }),
+    "prepare-timeout",
+  )
+})
+
+test("the preparation cap aborts a GitHub request whose response cancellation never settles", async () => {
+  const clock = manualClock()
+  const stageBudget = budget(clock)
+  clock.advance(59_950)
+  let cancelled = false
+  let signal: AbortSignal | null | undefined
+  const fetchImpl: FetchLike = async (_, init) => {
+    signal = init?.signal
+    return new Response(new ReadableStream({ cancel() { cancelled = true; return new Promise(() => {}) } }), { status: 503 })
+  }
+  await expectGitHubError(reader({ fetchImpl, clock }).capturePullRequest({ repository: REPOSITORY, pr: 17, budget: stageBudget }), "prepare-timeout")
+  expect(cancelled).toBe(true)
+  expect(signal?.aborted).toBe(true)
+})
+
+test("an unaffordable publish retry is unavailable, not a preparation timeout", async () => {
+  const clock = manualClock()
+  const stageBudget = budget(clock)
+  clock.advance(299_000)
+  const fetchImpl: FetchLike = async () => statusResponse(503, { "retry-after": "5" })
+  await expectGitHubError(reader({ fetchImpl, clock }).readWorkflow({ repository: REPOSITORY, runId: "987654321", budget: stageBudget, stage: "publish" }), "github-unavailable")
+  expect(clock.sleeps).toEqual([])
 })
 
 test("response bodies stream under the byte cap and the abort timer covers body consumption", async () => {

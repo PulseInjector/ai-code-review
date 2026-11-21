@@ -1,6 +1,7 @@
-import { writeFile } from "node:fs/promises"
+import { writeFilesBefore } from "./budget"
+import type { PrReviewResult } from "./pr-contracts"
 import { join } from "node:path"
-import { reviewResultSchema, type Candidate, type ReviewResult } from "./contracts"
+import { reviewResultSchema, type Candidate, type ReviewResult, type Verification } from "./contracts"
 import type { ContextManifest } from "./context"
 import type { DiscoveryVerificationResult } from "./discovery"
 import type { RuntimeResult } from "./runtime/contracts"
@@ -23,7 +24,7 @@ function sourceBlock(text: string): string {
   return `${fence}\n${text}\n${fence}`
 }
 
-export function renderMarkdown(result: ReviewResult): string {
+export function renderMarkdown(result: ReviewResult | PrReviewResult): string {
   const lines = [
     "# Code review", "", `Status: **${result.status}**`, "",
     `Snapshot: base \`${result.snapshot.baseSha}\`, head \`${result.snapshot.headSha}\`, merge base \`${result.snapshot.mergeBaseSha}\`.`, "",
@@ -63,6 +64,7 @@ export function createRunArtifacts(options: {
   durationMs: number
   runtime?: RuntimeResult
   candidates?: Candidate[]
+  verifications?: Verification[]
   promptVersions?: DiscoveryVerificationResult["versions"]
   error?: { stage: ReviewResult["stageErrors"][number]["stage"]; message: string }
   programVersion: string
@@ -110,23 +112,34 @@ export function createRunArtifacts(options: {
   return { result, markdown: renderMarkdown(result) }
 }
 
-export async function writeRunArtifacts(runDirectory: string, artifacts: RunArtifacts, options: {
-  discovery?: DiscoveryVerificationResult; runtime?: RuntimeResult; candidates?: Candidate[];
+export async function writeRunArtifacts(runDirectory: string, result: ReviewResult | PrReviewResult, options: {
+  discovery?: DiscoveryVerificationResult; runtime?: RuntimeResult; candidates?: Candidate[]; verifications?: Verification[];
   timing: { startedAt: string; deadline: string; preparationMs: number; analysisMs: number; attemptStartedAt?: string }
-}): Promise<void> {
+  finalDeadline: number
+  files: Array<[string, string]>
+}): Promise<boolean> {
   const runtime = options.discovery?.runtime ?? options.runtime
   const writes: Array<[string, string]> = [
-    ["result.json", `${JSON.stringify(artifacts.result, null, 2)}\n`],
-    ["report.md", artifacts.markdown],
-    ["coverage.json", `${JSON.stringify(artifacts.result.coverage, null, 2)}\n`],
-    ["timing.json", `${JSON.stringify({ ...options.timing, durationMs: artifacts.result.durationMs, phases: runtime?.sessions.map(({ name, durationMs }) => ({ name, durationMs: durationMs ?? null })) ?? [] }, null, 2)}\n`],
-    ["versions.json", `${JSON.stringify(artifacts.result.versions, null, 2)}\n`],
+    ...options.files,
+    ["report.md", renderMarkdown(result)],
+    ["coverage.json", `${JSON.stringify(result.coverage, null, 2)}\n`],
+    ["timing.json", `${JSON.stringify({ ...options.timing, durationMs: result.durationMs, phases: runtime?.sessions.map(({ name, durationMs }) => ({ name, durationMs: durationMs ?? null })) ?? [] }, null, 2)}\n`],
+    ["versions.json", `${JSON.stringify(result.versions, null, 2)}\n`],
     ["candidates.json", `${JSON.stringify(options.discovery?.candidates ?? options.candidates ?? [], null, 2)}\n`],
-    ["verifications.json", `${JSON.stringify(options.discovery?.verifications ?? [], null, 2)}\n`],
+    ["verifications.json", `${JSON.stringify(options.discovery?.verifications ?? options.verifications ?? [], null, 2)}\n`],
     ["tool-trace.json", `${JSON.stringify(runtime?.readBudget ?? { records: [], unavailable: true }, null, 2)}\n`],
+    // The request ledger is trace evidence: no request that reached the policy hooks is dropped,
+    // and the cap that stopped further requests is recorded instead of hidden.
+    ["requests.json", `${JSON.stringify({
+      requests: runtime?.requests ?? { records: [], capped: false, unavailable: true },
+      submission: runtime?.submission ?? { kind: "not-submitted" },
+      phaseDeadlines: runtime?.phaseDeadlines ?? null,
+      checkpointSequence: runtime?.checkpointSequence ?? 0,
+    }, null, 2)}\n`],
     ["sessions.json", `${JSON.stringify(runtime?.sessions ?? [], null, 2)}\n`],
-    ["usage.json", `${JSON.stringify(artifacts.result.usage, null, 2)}\n`],
+    ["usage.json", `${JSON.stringify(result.usage, null, 2)}\n`],
     ["cleanup.json", `${JSON.stringify(runtime?.cleanup ?? { hostClosed: false, forced: false, notStarted: true }, null, 2)}\n`],
+    ["result.json", `${JSON.stringify(result, null, 2)}\n`],
   ]
-  await Promise.all(writes.map(async ([name, content]) => writeFile(join(runDirectory, name), content, { flag: "wx", mode: 0o600 })))
+  return writeFilesBefore(writes.map(([name, content]) => [join(runDirectory, name), content]), options.finalDeadline)
 }

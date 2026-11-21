@@ -9,6 +9,11 @@
 
 The project uses the pinned OpenCode SDK and its embedded host API. A separately installed OpenCode CLI is not required.
 
+The review runtime disables model HTTP redirects, optional title generation,
+and background compaction. Each logical model call can send at most three
+requests. If the prompt response is lost, the worker checks the original
+session for the prompt and never resubmits it.
+
 ## Install and Check
 
 From the repository root:

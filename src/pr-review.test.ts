@@ -9,6 +9,8 @@ import { createJavaReviewRepository, type JavaReviewCommits } from "./fixtures/j
 import { boundCoverageForPublication, runPrReview } from "./pr-review"
 import { runReview } from "./review"
 import type { Candidate, Verification } from "./contracts"
+import type { Failure } from "./pr-contracts"
+import type { Sha256 } from "./identity"
 import { emptyReadBudget, type RuntimeResult } from "./runtime/contracts"
 import type { ProgressEvent } from "./progress"
 
@@ -92,6 +94,7 @@ function completed(candidates: Candidate[], verifications: Verification[]): Runt
       { name: "verify", status: "complete", text: JSON.stringify({ verifications }), usage: { kind: "known", inputTokens: 7, outputTokens: 3 }, durationMs: 12 },
     ],
     usage: { kind: "known", inputTokens: 12, outputTokens: 5 }, readBudget: emptyReadBudget(), cleanup: { hostClosed: true, forced: false },
+    checkpointSequence: 1, submission: { kind: "not-submitted" }, requests: { records: [], capped: false }, phaseDeadlines: null,
   }
 }
 const worker = async (): Promise<RuntimeResult> => completed([candidate], [keep])
@@ -768,3 +771,338 @@ test("a partial caused only by pending tool reads stays advisory", async () => {
   expect(outcome.outcome.result.stageErrors).toEqual([])
   expect(outcome.exitCode).toBe(0)
 })
+
+const failedSessionRuntime = (options: {
+  code: Failure["code"]
+  discoveryText: string
+  verificationText: string | null
+  cleanup: RuntimeResult["cleanup"]
+}): RuntimeResult => {
+  const sessions: RuntimeResult["sessions"] = [{
+    name: "discover", status: "complete", text: options.discoveryText,
+    usage: { kind: "known", inputTokens: 5, outputTokens: 2 }, durationMs: 10,
+  }]
+  if (options.verificationText !== null) {
+    sessions.push({ name: "verify", status: "complete", text: options.verificationText, usage: { kind: "known", inputTokens: 7, outputTokens: 3 }, durationMs: 12 })
+  }
+  return {
+    status: "timeout",
+    error: "worker exceeded the analysis deadline",
+    code: options.code,
+    sessions,
+    usage: { kind: "unknown", reason: "active session usage was not settled" },
+    readBudget: emptyReadBudget(),
+    cleanup: options.cleanup,
+    checkpointSequence: 3,
+    submission: { kind: "not-submitted" },
+    requests: { records: [{ sequence: 1, phase: "discovery", sessionId: "session", kind: "primary", attempt: 1, startedAt: "2026-11-21T00:00:01.000Z", finishedAt: null, status: null, outcome: "started" }], capped: false },
+    phaseDeadlines: null,
+  }
+}
+
+async function reviewWithFailingRuntime(runtime: RuntimeResult, outName: string) {
+  const execution = await localExecution()
+  const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, commits.defectSha) } })
+  const github = createGitHubReader({ GITHUB_TOKEN: "pr-review-token" }, { fetch: api.fetchImpl, gitRemoteUrl: () => origin, clock: manualClock() })
+  return runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out: join(root, outName) }, {
+    github,
+    execution,
+    progress: () => {},
+    model: () => configuration,
+    modelIdentity: testModelIdentity,
+    budget: freshBudget(),
+    runWorker: async () => runtime,
+  })
+}
+
+test("a verification timeout preserves the validated discovery checkpoint as a red partial", async () => {
+  const runtime = failedSessionRuntime({
+    code: "verification-timeout",
+    discoveryText: JSON.stringify({ candidates: [candidate] }),
+    verificationText: null,
+    cleanup: { hostClosed: false, forced: true },
+  })
+  const outcome = await reviewWithFailingRuntime(runtime, "verification-timeout")
+  expect(outcome.outcome.kind).toBe("reviewed")
+  if (outcome.outcome.kind !== "reviewed") throw new Error("unreachable")
+  expect(outcome.outcome.result.status).toBe("partial")
+  expect(outcome.outcome.result.issues).toEqual([])
+  expect(outcome.outcome.result.coverage.unverifiedCandidateIds).toEqual(["C-1"])
+  expect(outcome.outcome.result.stageErrors).toEqual([{ code: "verification-timeout", stage: "verification", message: "worker exceeded the analysis deadline" }])
+  expect(outcome.exitCode).toBe(1)
+  const requests = JSON.parse(await readFile(join(outcome.runDirectory, "requests.json"), "utf8"))
+  expect(requests.requests.records).toHaveLength(1)
+  expect(requests.requests.records[0]).toMatchObject({ phase: "discovery", kind: "primary", attempt: 1 })
+  expect(JSON.parse(await readFile(join(outcome.runDirectory, "candidates.json"), "utf8"))).toHaveLength(1)
+  expect(JSON.parse(await readFile(join(outcome.runDirectory, "result.json"), "utf8"))).toEqual(outcome.outcome.result)
+})
+
+test("a request cap alone is an advisory partial", async () => {
+  const runtime = failedSessionRuntime({
+    code: "request-budget",
+    discoveryText: JSON.stringify({ candidates: [candidate] }),
+    verificationText: null,
+    cleanup: { hostClosed: true, forced: false },
+  })
+  if (runtime.status === "complete") throw new Error("invalid fixture")
+  runtime.status = "failed"
+  const outcome = await reviewWithFailingRuntime(runtime, "request-budget")
+  expect(outcome.outcome.kind).toBe("reviewed")
+  if (outcome.outcome.kind !== "reviewed") throw new Error("unreachable")
+  expect(outcome.outcome.result.status).toBe("partial")
+  expect(outcome.outcome.result.coverage.unverifiedCandidateIds).toEqual(["C-1"])
+  expect(outcome.outcome.result.stageErrors[0]?.code).toBe("request-budget")
+  expect(outcome.exitCode).toBe(0)
+})
+
+test("a cleanup failure after validated verification keeps the accepted finds as a red partial", async () => {
+  const runtime = failedSessionRuntime({
+    code: "cleanup-failed",
+    discoveryText: JSON.stringify({ candidates: [candidate] }),
+    verificationText: JSON.stringify({ verifications: [keep] }),
+    cleanup: { hostClosed: false, forced: false },
+  })
+  if (runtime.status === "complete") throw new Error("invalid fixture")
+  runtime.status = "failed"
+  runtime.error = "SDK host cleanup failed"
+  const outcome = await reviewWithFailingRuntime(runtime, "cleanup-failed")
+  expect(outcome.outcome.kind).toBe("reviewed")
+  if (outcome.outcome.kind !== "reviewed") throw new Error("unreachable")
+  expect(outcome.outcome.result.status).toBe("partial")
+  expect(outcome.outcome.result.issues).toHaveLength(1)
+  expect(outcome.outcome.result.issues[0]?.candidate.id).toBe("C-1")
+  expect(outcome.outcome.result.coverage.unverifiedCandidateIds).toEqual([])
+  expect(outcome.outcome.result.stageErrors[0]?.code).toBe("cleanup-failed")
+  expect(outcome.exitCode).toBe(1)
+})
+
+test("a discovery timeout without validated work fails the review with its typed code", async () => {
+  const runtime: RuntimeResult = {
+    status: "timeout",
+    error: "worker exceeded the analysis deadline",
+    code: "discovery-timeout",
+    sessions: [{ name: "discover", status: "interrupted", error: "the phase deadline elapsed before the session settled", code: "discovery-timeout", usage: { kind: "unknown", reason: "active session usage was not settled" } }],
+    usage: { kind: "unknown", reason: "worker did not settle usage before the deadline" },
+    readBudget: emptyReadBudget(),
+    cleanup: { hostClosed: false, forced: true },
+    checkpointSequence: 2,
+    submission: { kind: "acceptance-unknown", sessionId: "session", promptDigest: sha256("prompt") as Sha256 },
+    requests: { records: [], capped: false },
+    phaseDeadlines: null,
+  }
+  const outcome = await reviewWithFailingRuntime(runtime, "discovery-timeout")
+  expect(outcome.outcome.kind).toBe("failed")
+  if (outcome.outcome.kind !== "failed") throw new Error("unreachable")
+  expect(outcome.outcome.failure.code).toBe("discovery-timeout")
+  expect(outcome.outcome.failure.stage).toBe("discovery")
+  expect(outcome.exitCode).toBe(1)
+})
+
+test("a real hung worker finishes inside the run budget and exports no sentinels", async () => {
+  // The full real orchestration: real capture against injected API metadata, real Git fetch of
+  // fixed objects through the askpass route, real export, and the production isolated worker
+  // stalled on a loopback provider. The run must end inside its budget with the process group
+  // gone, and no sentinel credential may survive into the replay export.
+  const stallRoot = await mkdtemp(join(tmpdir(), "pr-review-stall-"))
+  let requests = 0
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => {
+    requests++
+    return new Promise<Response>(() => {})
+  } })
+  const out = join(root, "real-hung-worker")
+  try {
+    const execution = await localExecution()
+    const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, commits.defectSha) } })
+    const github = createGitHubReader({ GITHUB_TOKEN: "pr-review-sentinel-token" }, {
+      fetch: api.fetchImpl,
+      gitRemoteUrl: () => origin,
+    })
+    const started = Date.now()
+    const outcome = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out }, {
+      github,
+      execution,
+      progress: () => {},
+      model: () => ({
+        apiKey: "model-sentinel-key",
+        model: { providerID: "scripted", baseURL: `http://127.0.0.1:${server.port}/v1`, modelID: "stalled" },
+      }),
+      modelIdentity: () => ({ providerId: "scripted", modelId: "stalled" }),
+      budget: createBudget(systemClock, 20_000),
+    })
+    const elapsed = Date.now() - started
+    expect(requests).toBeGreaterThan(0)
+    expect(outcome.outcome.kind).toBe("failed")
+    if (outcome.outcome.kind !== "failed") throw new Error("unreachable")
+    expect(["discovery-timeout", "verification-timeout"]).toContain(outcome.outcome.failure.code)
+    expect(outcome.exitCode).toBe(1)
+    expect(outcome.outcome.failure.stage).toBe("discovery")
+    // The run finished inside its own budget even though the provider never answered.
+    expect(elapsed).toBeLessThan(25_000)
+    const scan = async (directory: string): Promise<void> => {
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name)
+        if (entry.isDirectory()) await scan(path)
+        else if (entry.isFile()) {
+          const text = await readFile(path, "utf8")
+          expect(text).not.toContain("model-sentinel-key")
+          expect(text).not.toContain("pr-review-sentinel-token")
+        }
+      }
+    }
+    await scan(outcome.runDirectory)
+  } finally {
+    await server.stop(true)
+    await rm(stallRoot, { recursive: true, force: true })
+  }
+}, 60_000)
+
+test("invalid verification text under a recoverable runtime stop fails instead of a partial", async () => {
+  // The worker reports a cleanup failure, but the completed verification text is invalid: the
+  // parent's schema rejection outranks the recoverable stop, so no partial is published.
+  const runtime: RuntimeResult = {
+    status: "failed",
+    error: "SDK host cleanup failed",
+    code: "cleanup-failed",
+    sessions: [
+      { name: "discover", status: "complete", text: JSON.stringify({ candidates: [candidate] }), usage: { kind: "known", inputTokens: 5, outputTokens: 2 }, durationMs: 10 },
+      { name: "verify", status: "complete", text: "not json", usage: { kind: "known", inputTokens: 7, outputTokens: 3 }, durationMs: 12 },
+    ],
+    usage: { kind: "known", inputTokens: 12, outputTokens: 5 }, readBudget: emptyReadBudget(),
+    cleanup: { hostClosed: false, forced: false },
+    checkpointSequence: 2, submission: { kind: "not-submitted" }, requests: { records: [], capped: false }, phaseDeadlines: null,
+  }
+  const outcome = await reviewWithFailingRuntime(runtime, "invalid-verification")
+  expect(outcome.outcome.kind).toBe("failed")
+  if (outcome.outcome.kind !== "failed") throw new Error("unreachable")
+  expect(outcome.outcome.failure.code).toBe("model-format")
+  expect(outcome.outcome.failure.stage).toBe("verification")
+  expect(outcome.exitCode).toBe(1)
+  // The validated discovery evidence is still retained in replay.
+  expect(JSON.parse(await readFile(join(outcome.runDirectory, "candidates.json"), "utf8"))).toHaveLength(1)
+  expect(JSON.parse(await readFile(join(outcome.runDirectory, "verifications.json"), "utf8"))).toEqual([])
+})
+
+test("a session with the wrong phase name never contributes a checkpoint", async () => {
+  const runtime: RuntimeResult = {
+    status: "timeout",
+    error: "worker exceeded the analysis deadline",
+    code: "verification-timeout",
+    sessions: [
+      { name: "discover", status: "complete", text: JSON.stringify({ candidates: [candidate] }), usage: { kind: "known", inputTokens: 5, outputTokens: 2 }, durationMs: 10 },
+      { name: "title", status: "complete", text: JSON.stringify({ verifications: [keep] }), usage: { kind: "known", inputTokens: 7, outputTokens: 3 }, durationMs: 12 },
+    ],
+    usage: { kind: "unknown", reason: "active session usage was not settled" }, readBudget: emptyReadBudget(),
+    cleanup: { hostClosed: false, forced: true },
+    checkpointSequence: 2, submission: { kind: "not-submitted" }, requests: { records: [], capped: false }, phaseDeadlines: null,
+  }
+  const outcome = await reviewWithFailingRuntime(runtime, "wrong-phase-name")
+  // The discover session still forms a discovered checkpoint, so the recoverable timeout yields a
+  // partial, but the misnamed session's text never validates as verification work: no keep is
+  // published and the discovered candidate stays unverified.
+  expect(outcome.outcome.kind).toBe("reviewed")
+  if (outcome.outcome.kind !== "reviewed") throw new Error("unreachable")
+  expect(outcome.outcome.result.status).toBe("partial")
+  expect(outcome.outcome.result.issues).toEqual([])
+  expect(outcome.outcome.result.coverage.unverifiedCandidateIds).toEqual(["C-1"])
+  expect(outcome.exitCode).toBe(1)
+  expect(JSON.parse(await readFile(join(outcome.runDirectory, "verifications.json"), "utf8"))).toEqual([])
+})
+
+test("fully verified empty work under a cleanup failure stays a red partial", async () => {
+  // Zero candidates with a validated verification is completed work, not absent work: the
+  // checkpoint kind comes from parent validation, so the cleanup failure yields a partial.
+  const runtime: RuntimeResult = {
+    status: "failed",
+    error: "SDK host cleanup failed",
+    code: "cleanup-failed",
+    sessions: [
+      { name: "discover", status: "complete", text: JSON.stringify({ candidates: [] }), usage: { kind: "known", inputTokens: 5, outputTokens: 2 }, durationMs: 10 },
+      { name: "verify", status: "complete", text: JSON.stringify({ verifications: [] }), usage: { kind: "known", inputTokens: 7, outputTokens: 3 }, durationMs: 12 },
+    ],
+    usage: { kind: "known", inputTokens: 12, outputTokens: 5 }, readBudget: emptyReadBudget(),
+    cleanup: { hostClosed: false, forced: false },
+    checkpointSequence: 2, submission: { kind: "not-submitted" }, requests: { records: [], capped: false }, phaseDeadlines: null,
+  }
+  const outcome = await reviewWithFailingRuntime(runtime, "verified-empty-cleanup")
+  expect(outcome.outcome.kind).toBe("reviewed")
+  if (outcome.outcome.kind !== "reviewed") throw new Error("unreachable")
+  expect(outcome.outcome.result.status).toBe("partial")
+  expect(outcome.outcome.result.issues).toEqual([])
+  expect(outcome.outcome.result.coverage.unverifiedCandidateIds).toEqual([])
+  expect(outcome.outcome.result.stageErrors.map((error) => error.code)).toContain("cleanup-failed")
+  expect(outcome.exitCode).toBe(1)
+})
+
+test("an outright model failure keeps its code when the host close also fails", async () => {
+  const runtime: RuntimeResult = {
+    status: "failed",
+    error: "provider rejected the request authentication",
+    code: "model-auth",
+    sessions: [
+      { name: "discover", status: "failed", error: "provider rejected the request authentication", code: "model-auth", usage: { kind: "unknown", reason: "active session usage was not settled" } },
+    ],
+    usage: { kind: "unknown", reason: "worker usage was not settled" }, readBudget: emptyReadBudget(),
+    cleanup: { hostClosed: false, forced: false, closeFailure: "the SDK host close failed after the model failure" },
+    checkpointSequence: 1, submission: { kind: "not-submitted" }, requests: { records: [], capped: false }, phaseDeadlines: null,
+  }
+  const outcome = await reviewWithFailingRuntime(runtime, "auth-close-failure")
+  expect(outcome.outcome.kind).toBe("failed")
+  if (outcome.outcome.kind !== "failed") throw new Error("unreachable")
+  expect(outcome.outcome.failure.code).toBe("model-auth")
+  expect(outcome.exitCode).toBe(1)
+  // The close failure is recorded beside the primary outcome instead of erasing it.
+  const cleanup = JSON.parse(await readFile(join(outcome.runDirectory, "cleanup.json"), "utf8"))
+  expect(cleanup.closeFailure).toContain("SDK host close failed")
+  expect(cleanup.hostClosed).toBe(false)
+})
+
+test("a cleanup failure after validated verification retains the verifications in replay", async () => {
+  const runtime = failedSessionRuntime({
+    code: "cleanup-failed",
+    discoveryText: JSON.stringify({ candidates: [candidate] }),
+    verificationText: JSON.stringify({ verifications: [keep] }),
+    cleanup: { hostClosed: false, forced: false },
+  })
+  if (runtime.status === "complete") throw new Error("invalid fixture")
+  runtime.status = "failed"
+  runtime.error = "SDK host cleanup failed"
+  const outcome = await reviewWithFailingRuntime(runtime, "cleanup-replay-retention")
+  expect(outcome.outcome.kind).toBe("reviewed")
+  if (outcome.outcome.kind !== "reviewed") throw new Error("unreachable")
+  expect(outcome.outcome.result.issues).toHaveLength(1)
+  expect(JSON.parse(await readFile(join(outcome.runDirectory, "verifications.json"), "utf8"))).toHaveLength(1)
+  expect(JSON.parse(await readFile(join(outcome.runDirectory, "candidates.json"), "utf8"))).toHaveLength(1)
+  expect(JSON.parse(await readFile(join(outcome.runDirectory, "result.json"), "utf8"))).toEqual(outcome.outcome.result)
+})
+
+test("a hanging fixed-repository cleanup is abandoned at the run deadline and the analysis survives", async () => {
+  const execution = await localExecution()
+  const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, commits.defectSha) } })
+  const base = createGitHubReader({ GITHUB_TOKEN: "pr-review-token" }, { fetch: api.fetchImpl, gitRemoteUrl: () => origin, clock: manualClock() })
+  const hangingDispose: GitHubReader = {
+    ...base,
+    prepareFixedRepository: async (input) => {
+      const fixed = await base.prepareFixedRepository(input)
+      return { ...fixed, dispose: () => new Promise<void>(() => {}) }
+    },
+  }
+  const started = Date.now()
+  const outcome = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out: join(root, "dispose-hang") }, {
+    github: hangingDispose,
+    execution,
+    progress: () => {},
+    model: () => configuration,
+    modelIdentity: testModelIdentity,
+    budget: createBudget(systemClock, 15_000),
+    runWorker: worker,
+  })
+  // The run finishes inside its own budget even though cleanup never returns, and the validated
+  // analysis survives as a partial carrying the cleanup failure.
+  expect(Date.now() - started).toBeLessThan(20_000)
+  expect(outcome.outcome.kind).toBe("reviewed")
+  if (outcome.outcome.kind !== "reviewed") throw new Error("unreachable")
+  expect(outcome.outcome.result.status).toBe("partial")
+  expect(outcome.outcome.result.stageErrors.map((error) => error.code)).toContain("cleanup-failed")
+  expect(outcome.outcome.result.issues).toHaveLength(1)
+  expect(outcome.exitCode).toBe(1)
+}, 40_000)

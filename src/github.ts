@@ -13,7 +13,7 @@ import {
   actionsExecutionSchema, localExecutionSchema, type ActionsExecution, type Execution,
   type Failure, type PullRequestIdentity, type Trigger,
 } from "./pr-contracts"
-import { systemClock, type Clock, type ExecutionBudget } from "./budget"
+import { BudgetExhaustedError, systemClock, withinDeadline, withinStage, type Clock, type ExecutionBudget, type Stage } from "./budget"
 
 const API_ORIGIN = "https://api.github.com"
 const WEB_ORIGIN = "https://github.com"
@@ -175,12 +175,12 @@ export type ArtifactReceipt = { id: string; name: string; workflowRunId: string;
 export type SourceLineRequest = { sha: GitSha; path: string; startLine: number; endLine: number }
 
 export interface GitHubReader {
-  capturePullRequest(input: { repository: string; pr: number; budget: ExecutionBudget }): Promise<PullRequestCapture>
-  readWorkflow(input: { repository: string; runId: string; budget: ExecutionBudget }): Promise<WorkflowObservation>
-  prepareFixedRepository(input: { captured: PullRequestCapture; configPath: string; budget: ExecutionBudget }): Promise<FixedRepository>
-  readProductComment(input: { identity: PullRequestIdentity; budget: ExecutionBudget }): Promise<CommentObservation>
-  readArtifactReceipt(input: { identity: PullRequestIdentity; execution: ActionsExecution; budget: ExecutionBudget }): Promise<ArtifactReceipt | null>
-  readFixedLines(input: SourceLineRequest & { repository: string; budget: ExecutionBudget }): Promise<string>
+  capturePullRequest(input: { repository: string; pr: number; budget: ExecutionBudget; stage?: Stage }): Promise<PullRequestCapture>
+  readWorkflow(input: { repository: string; runId: string; budget: ExecutionBudget; stage?: Stage }): Promise<WorkflowObservation>
+  prepareFixedRepository(input: { captured: PullRequestCapture; configPath: string; budget: ExecutionBudget; stage?: Stage }): Promise<FixedRepository>
+  readProductComment(input: { identity: PullRequestIdentity; budget: ExecutionBudget; stage?: Stage }): Promise<CommentObservation>
+  readArtifactReceipt(input: { identity: PullRequestIdentity; execution: ActionsExecution; budget: ExecutionBudget; stage?: Stage }): Promise<ArtifactReceipt | null>
+  readFixedLines(input: SourceLineRequest & { repository: string; budget: ExecutionBudget; stage?: Stage }): Promise<string>
 }
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>
@@ -238,15 +238,13 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
     const reader = body.getReader()
     const chunks: Uint8Array[] = []
     let received = 0
+    const abort = () => { void reader.cancel().catch(() => undefined) }
+    signal.addEventListener("abort", abort, { once: true })
     try {
       for (;;) {
-        const { done, value } = await Promise.race([
-          reader.read(),
-          new Promise<never>((_, reject) => {
-            if (signal.aborted) reject(new Error("the response body was aborted"))
-            else signal.addEventListener("abort", () => reject(new Error("the response body was aborted")), { once: true })
-          }),
-        ])
+        signal.throwIfAborted()
+        const { done, value } = await reader.read()
+        signal.throwIfAborted()
         if (done) break
         received += value.byteLength
         if (received > byteCap) throw new GitHubError("the GitHub response exceeded the byte cap", oversizeCode)
@@ -255,6 +253,8 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
     } catch (error) {
       await reader.cancel().catch(() => undefined)
       throw error
+    } finally {
+      signal.removeEventListener("abort", abort)
     }
     const bytes = new Uint8Array(received)
     let offset = 0
@@ -276,76 +276,74 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
   // One shared read retry policy: transient transport errors, 429, and 500/502/503/504 retry at
   // most twice with 1,000 and 2,000 ms delays, bounded below by Retry-After. Authentication,
   // permission, 404, redirect, schema, malformed-JSON, TLS, and invalid-URL failures never retry.
-  // A delay that cannot fit in the remaining budget reports the rate limit when rate limited and
-  // the stage timeout otherwise.
-  async function apiJson(input: { url: string; budget: ExecutionBudget; byteCap?: number; oversizeCode?: Failure["code"] }): Promise<{ value: unknown; bytes: number; headers: Headers }> {
+  // Every request and every backoff consume the calling stage's remaining time, not only the total
+  // budget, so capture and preparation stop at their own 60-second cap.
+  async function apiJson(input: { url: string; budget: ExecutionBudget; stage: Stage; byteCap?: number; oversizeCode?: Failure["code"] }): Promise<{ value: unknown; bytes: number; headers: Headers }> {
+    const deadlineCode = input.stage === "prepare-init" ? "prepare-timeout" : "github-unavailable"
     const byteCap = input.byteCap ?? REQUEST_BYTE_CAP
     const oversizeCode = input.oversizeCode ?? "github-unavailable"
-    for (let attempt = 0; ; attempt++) {
-      if (input.budget.remainingMs() <= 0) throw new GitHubError("the execution budget was exhausted before the GitHub request", "prepare-timeout")
-      const timeoutMs = Math.max(1, Math.min(PER_REQUEST_TIMEOUT_MS, input.budget.remainingMs()))
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), timeoutMs)
-      let response: Response
-      try {
-        response = await doFetch(input.url, {
-          method: "GET",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": PRODUCT_USER_AGENT,
-          },
-          redirect: "manual",
-          signal: controller.signal,
-        })
-        if (response.status === 200) {
-          let bytes: Uint8Array
+    const request = async (signal: AbortSignal) => {
+      const response = await doFetch(input.url, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": PRODUCT_USER_AGENT,
+        },
+        redirect: "manual",
+        signal,
+      })
+      if (response.status !== 200 || signal.aborted) {
+        await response.body?.cancel().catch(() => undefined)
+        signal.throwIfAborted()
+        return { response, bytes: null }
+      }
+      return { response, bytes: await readCapped(response, byteCap, oversizeCode, signal) }
+    }
+    try {
+      return await withinStage(input.budget, input.stage, async (stageSignal) => {
+        for (let attempt = 0; ; attempt++) {
+          stageSignal.throwIfAborted()
+          input.budget.assertRemaining(input.stage)
+          const timeoutMs = Math.min(PER_REQUEST_TIMEOUT_MS, input.budget.stageRemainingMs(input.stage))
+          let read: Awaited<ReturnType<typeof request>> | null = null
           try {
-            bytes = await readCapped(response, byteCap, oversizeCode, controller.signal)
-          } finally {
-            clearTimeout(timer)
+            const result = await withinDeadline((requestSignal) => request(AbortSignal.any([stageSignal, requestSignal])), Date.now() + timeoutMs)
+            if (result.kind === "completed") read = result.value
+          } catch (error) {
+            stageSignal.throwIfAborted()
+            if (error instanceof GitHubError) throw error
+            if (isPermanentTransportFailure(error)) throw new GitHubError("GitHub rejected the request transport permanently", "github-unavailable")
           }
-          let value: unknown
-          try {
-            value = JSON.parse(lenientDecoder.decode(bytes))
-          } catch {
-            throw new GitHubError("GitHub returned malformed JSON", "github-unavailable")
+          if (read !== null && read.bytes !== null) {
+            const { response, bytes } = read
+            try {
+              const value: unknown = JSON.parse(lenientDecoder.decode(bytes))
+              return { value, bytes: bytes.byteLength, headers: response.headers }
+            } catch {
+              throw new GitHubError("GitHub returned malformed JSON", "github-unavailable")
+            }
           }
-          return { value, bytes: bytes.byteLength, headers: response.headers }
+          const response = read?.response
+          const retryDelay = RETRY_DELAYS_MS[attempt]
+          if (response && response.status >= 300 && response.status < 400) {
+            throw new GitHubError("the GitHub API returned a redirect, which API JSON requests never follow", "github-unavailable")
+          }
+          const rateLimited = response !== undefined && (response.status === 429 || (response.status === 403 && rateLimitEvidence(response)))
+          if (response && (!rateLimited && !RETRIABLE_STATUSES.has(response.status) || retryDelay === undefined)) throw classifiedError(response)
+          if (retryDelay === undefined) throw new GitHubError("GitHub transport failures exhausted the permitted read retries", "github-unavailable")
+          const delay = Math.max(retryDelay, response ? retryAfterMs(response.headers) : 0)
+          if (!input.budget.canStartRequest(input.stage, delay + 1)) {
+            if (rateLimited && response) throw classifiedError(response)
+            throw new GitHubError("the retry delay cannot fit in the remaining execution budget", deadlineCode)
+          }
+          await clock.sleep(delay, stageSignal)
         }
-      } catch (error) {
-        clearTimeout(timer)
-        if (error instanceof GitHubError) throw error
-        if (isPermanentTransportFailure(error)) {
-          throw new GitHubError("GitHub rejected the request transport permanently", "github-unavailable")
-        }
-        if (attempt >= RETRY_DELAYS_MS.length) throw new GitHubError("GitHub transport failures exhausted the permitted read retries", "github-unavailable")
-        const delay = RETRY_DELAYS_MS[attempt]!
-        if (delay >= input.budget.remainingMs()) {
-          throw new GitHubError("the retry delay cannot fit in the remaining execution budget", "prepare-timeout")
-        }
-        await clock.sleep(delay, new AbortController().signal)
-        continue
-      }
-      // A discarded response body is cancelled before classification, retry, or timer cleanup, so
-      // no unread stream outlives the request that opened it.
-      await response.body?.cancel().catch(() => undefined)
-      clearTimeout(timer)
-      if (response.status >= 300 && response.status < 400) {
-        throw new GitHubError("the GitHub API returned a redirect, which API JSON requests never follow", "github-unavailable")
-      }
-      const rateLimited = response.status === 429 || (response.status === 403 && rateLimitEvidence(response))
-      const retriable = rateLimited || RETRIABLE_STATUSES.has(response.status)
-      if (!retriable) throw classifiedError(response)
-      if (attempt >= RETRY_DELAYS_MS.length) throw classifiedError(response)
-      const delay = Math.max(RETRY_DELAYS_MS[attempt]!, retryAfterMs(response.headers))
-      if (delay >= input.budget.remainingMs()) {
-        throw rateLimited
-          ? classifiedError(response)
-          : new GitHubError("the retry delay cannot fit in the remaining execution budget", "prepare-timeout")
-      }
-      await clock.sleep(delay, new AbortController().signal)
+      })
+    } catch (error) {
+      if (error instanceof BudgetExhaustedError) throw new GitHubError(error.message, deadlineCode)
+      throw error
     }
   }
 
@@ -362,8 +360,8 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
     }
   }
 
-  function gitBytes(input: { args: string[]; env: Record<string, string>; budget: ExecutionBudget; label: string; failureCode: Failure["code"] }): Uint8Array {
-    const remaining = Math.floor(input.budget.remainingMs())
+  function gitBytes(input: { args: string[]; env: Record<string, string>; budget: ExecutionBudget; stage: Stage; label: string; failureCode: Failure["code"] }): Uint8Array {
+    const remaining = Math.floor(Math.min(input.budget.stageRemainingMs(input.stage), input.budget.remainingMs()))
     if (remaining <= 0) throw new GitHubError("the execution budget was exhausted before a Git command", "prepare-timeout")
     deps.observeGit?.({ args: input.args, env: input.env })
     const result = Bun.spawnSync(["git", "-c", "credential.helper=", "-c", "core.hooksPath=/dev/null", ...input.args], {
@@ -381,7 +379,7 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
     return result.stdout
   }
 
-  function gitText(input: { args: string[]; env: Record<string, string>; budget: ExecutionBudget; label: string; failureCode: Failure["code"] }): string {
+  function gitText(input: { args: string[]; env: Record<string, string>; budget: ExecutionBudget; stage: Stage; label: string; failureCode: Failure["code"] }): string {
     return lenientDecoder.decode(gitBytes(input)).trim()
   }
 
@@ -390,11 +388,12 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
     return writeFile(askPassPath, ASKPASS_SCRIPT, { mode: 0o700 }).then(() => askPassPath)
   }
 
-  async function fetchFixedObjects(input: { directory: string; env: Record<string, string>; budget: ExecutionBudget; repository: string; objects: string[] }): Promise<void> {
+  async function fetchFixedObjects(input: { directory: string; env: Record<string, string>; budget: ExecutionBudget; stage: Stage; repository: string; objects: string[] }): Promise<void> {
     gitBytes({
       args: ["-C", input.directory, "fetch", "--no-tags", "--no-recurse-submodules", remoteUrl(input.repository), ...input.objects],
       env: input.env,
       budget: input.budget,
+      stage: input.stage,
       label: "fetch of the captured object IDs",
       failureCode: "snapshot-fetch",
     })
@@ -403,6 +402,7 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
         args: ["-C", input.directory, "cat-file", "-e", `${object}^{commit}`],
         env: input.env,
         budget: input.budget,
+        stage: input.stage,
         label: "cat-file verification",
         failureCode: "snapshot-fetch",
       })
@@ -410,6 +410,7 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
         args: ["-C", input.directory, "rev-parse", "--verify", `${object}^{commit}`],
         env: input.env,
         budget: input.budget,
+        stage: input.stage,
         label: "rev-parse verification",
         failureCode: "snapshot-fetch",
       })
@@ -431,9 +432,9 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
   // The configuration is read from the fixed base tree, so a PR edit to the configuration cannot
   // change this run's rules. Only the documented default path permits a missing blob; an existing
   // malformed, non-regular, or oversized config always fails.
-  async function readFrozenConfig(input: { directory: string; env: Record<string, string>; baseSha: GitSha; configPath: string; budget: ExecutionBudget }): Promise<{ limits: ReviewLimits; source: FixedRepository["configSource"] }> {
+  async function readFrozenConfig(input: { directory: string; env: Record<string, string>; baseSha: GitSha; configPath: string; budget: ExecutionBudget; stage: Stage }): Promise<{ limits: ReviewLimits; source: FixedRepository["configSource"] }> {
     const requested = parseInput(relativePathSchema, input.configPath, "configuration path")
-    const entry = literalTreeEntry({ directory: input.directory, env: input.env, budget: input.budget, sha: input.baseSha, path: requested, label: "configuration ls-tree", failureCode: "snapshot-fetch" })
+    const entry = literalTreeEntry({ directory: input.directory, env: input.env, budget: input.budget, stage: input.stage, sha: input.baseSha, path: requested, label: "configuration ls-tree", failureCode: "snapshot-fetch" })
     if (entry === null) {
       if (requested === DEFAULT_CONFIG_PATH) return productDefaultConfig()
       throw new GitHubError(`the configuration path ${requested} is absent from the fixed base`, "config-invalid")
@@ -444,11 +445,11 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
     if (entry.mode !== "100644" && entry.mode !== "100755") {
       throw new GitHubError(`the configuration blob at ${requested} is not a regular file`, "config-invalid")
     }
-    const size = gitText({ args: ["-C", input.directory, "cat-file", "-s", entry.oid], env: input.env, budget: input.budget, label: "configuration size", failureCode: "snapshot-fetch" })
+    const size = gitText({ args: ["-C", input.directory, "cat-file", "-s", entry.oid], env: input.env, budget: input.budget, stage: input.stage, label: "configuration size", failureCode: "snapshot-fetch" })
     if (!/^[0-9]+$/u.test(size) || Number(size) > FIXED_CONFIG_BYTE_LIMIT) {
       throw new GitHubError(`the configuration blob at ${requested} exceeds the ${FIXED_CONFIG_BYTE_LIMIT}-byte limit`, "config-invalid")
     }
-    const bytes = gitBytes({ args: ["-C", input.directory, "cat-file", "blob", entry.oid], env: input.env, budget: input.budget, label: "configuration blob", failureCode: "snapshot-fetch" })
+    const bytes = gitBytes({ args: ["-C", input.directory, "cat-file", "blob", entry.oid], env: input.env, budget: input.budget, stage: input.stage, label: "configuration blob", failureCode: "snapshot-fetch" })
     let limits: ReviewLimits
     try {
       limits = reviewLimitsSchema.parse(JSON.parse(strictDecoder.decode(bytes)))
@@ -496,11 +497,12 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
   // compared against the request so a Git pathspec cannot select a different blob. All entry
   // types are parsed here so a directory or gitlink reaches its caller's own classification
   // instead of surfacing as an unreadable Git read.
-  function literalTreeEntry(input: { directory: string; env: Record<string, string>; budget: ExecutionBudget; sha: GitSha; path: string; label: string; failureCode: Failure["code"] }): { mode: string; type: "blob" | "tree" | "commit" | "tag"; oid: string } | null {
+  function literalTreeEntry(input: { directory: string; env: Record<string, string>; budget: ExecutionBudget; stage: Stage; sha: GitSha; path: string; label: string; failureCode: Failure["code"] }): { mode: string; type: "blob" | "tree" | "commit" | "tag"; oid: string } | null {
     const bytes = gitBytes({
       args: ["-C", input.directory, "ls-tree", "-z", input.sha, "--", `:(literal)${input.path}`],
       env: input.env,
       budget: input.budget,
+      stage: input.stage,
       label: input.label,
       failureCode: input.failureCode,
     })
@@ -520,15 +522,15 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
   }
 
   return {
-    async capturePullRequest({ repository, pr, budget }): Promise<PullRequestCapture> {
+    async capturePullRequest({ repository, pr, budget, stage = "prepare-init" }): Promise<PullRequestCapture> {
       const name = parseRepository(repository)
       const number = parseInput(prNumberSchema, pr, "pull request number")
       const base = apiRepositoryPath(name)
-      const repositoryRecord = parseResponse(repositoryResponseSchema, (await apiJson({ url: base, budget })).value, "repository")
+      const repositoryRecord = parseResponse(repositoryResponseSchema, (await apiJson({ url: base, budget, stage })).value, "repository")
       if (repositoryRecord.full_name !== repository) {
         throw new GitHubError("the repository response does not name the requested repository", "github-not-found")
       }
-      const pull = parseResponse(pullResponseSchema, (await apiJson({ url: `${base}/pulls/${number}`, budget })).value, "pull request")
+      const pull = parseResponse(pullResponseSchema, (await apiJson({ url: `${base}/pulls/${number}`, budget, stage })).value, "pull request")
       if (pull.number !== number) throw new GitHubError("the pull request response does not name the requested pull request", "github-not-found")
       if (pull.base.repo.id !== repositoryRecord.id) {
         throw new GitHubError("the pull request base repository does not match the requested repository", "github-not-found")
@@ -550,9 +552,9 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
       }
     },
 
-    async readWorkflow({ repository, runId, budget }): Promise<WorkflowObservation> {
+    async readWorkflow({ repository, runId, budget, stage = "prepare-init" }): Promise<WorkflowObservation> {
       const id = parseInput(runIdSchema, runId, "workflow run ID")
-      const run = parseResponse(workflowRunResponseSchema, (await apiJson({ url: `${apiRepositoryPath(repository)}/actions/runs/${id}`, budget })).value, "workflow run")
+      const run = parseResponse(workflowRunResponseSchema, (await apiJson({ url: `${apiRepositoryPath(repository)}/actions/runs/${id}`, budget, stage })).value, "workflow run")
       return {
         repositoryId: run.repository.id,
         runId: run.id,
@@ -564,8 +566,8 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
       }
     },
 
-    async prepareFixedRepository({ captured, configPath, budget }): Promise<FixedRepository> {
-      budget.assertRemaining("prepare-init")
+    async prepareFixedRepository({ captured, configPath, budget, stage = "prepare-init" }): Promise<FixedRepository> {
+      budget.assertRemaining(stage)
       const parent = await mkdtemp(join(tmpdir(), "ai-code-review-fixed-"))
       let released = false
       const release = async (): Promise<void> => {
@@ -576,17 +578,18 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
       try {
         const directory = join(parent, "repo.git")
         const env = gitEnvironment(await writeAskPassHelper(parent))
-        gitBytes({ args: ["init", "--bare", "--quiet", directory], env, budget, label: "bare repository init", failureCode: "snapshot-fetch" })
-        await fetchFixedObjects({ directory, env, budget, repository: captured.identity.repository, objects: [captured.baseSha, captured.headSha] })
+        gitBytes({ args: ["init", "--bare", "--quiet", directory], env, budget, stage, label: "bare repository init", failureCode: "snapshot-fetch" })
+        await fetchFixedObjects({ directory, env, budget, stage, repository: captured.identity.repository, objects: [captured.baseSha, captured.headSha] })
         const mergeBase = gitText({
           args: ["-C", directory, "merge-base", captured.baseSha, captured.headSha],
           env,
           budget,
+          stage,
           label: "merge-base computation",
           failureCode: "snapshot-fetch",
         })
         if (mergeBase === "") throw new GitHubError("the captured base and head share no merge base", "snapshot-fetch")
-        const config = await readFrozenConfig({ directory, env, baseSha: captured.baseSha, configPath, budget })
+        const config = await readFrozenConfig({ directory, env, baseSha: captured.baseSha, configPath, budget, stage })
         return { directory, config: config.limits, configSource: config.source, dispose: release }
       } catch (error) {
         await release().catch(() => undefined)
@@ -594,7 +597,7 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
       }
     },
 
-    async readProductComment({ identity, budget }): Promise<CommentObservation> {
+    async readProductComment({ identity, budget, stage = "prepare-init" }): Promise<CommentObservation> {
       // A human may copy the marker text, but author login, numeric ID, and type must all match
       // the product bot policy before a comment is owned, and the complete first line must equal
       // the marker exactly. The whole list is scanned before absence is chosen.
@@ -613,7 +616,7 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
         requests += 1
         if (seenPages.has(url)) throw new GitHubError("GitHub repeated a comment page during pagination", "comment-list-limit")
         seenPages.add(url)
-        const response = await apiJson({ url, budget, byteCap: COMMENT_LIST_BYTE_CAP, oversizeCode: "comment-list-limit" })
+        const response = await apiJson({ url, budget, stage, byteCap: COMMENT_LIST_BYTE_CAP, oversizeCode: "comment-list-limit" })
         const comments = parseResponse(commentListSchema, response.value, "comment list")
         decodedBytes += response.bytes
         if (decodedBytes > COMMENT_LIST_BYTE_CAP) throw new GitHubError("the comment listing exceeded the decoded byte cap", "comment-list-limit")
@@ -656,8 +659,8 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
       return { kind: "owned", canonical: canonical!, duplicateIds: duplicates.map(({ id }) => id), humanMarkerIds }
     },
 
-    async readArtifactReceipt({ identity, execution, budget }): Promise<ArtifactReceipt | null> {
-      const runJson = await apiJson({ url: `${apiRepositoryPath(identity.repository)}/actions/runs/${execution.workflowRunId}/artifacts?per_page=100`, budget })
+    async readArtifactReceipt({ identity, execution, budget, stage = "publish" }): Promise<ArtifactReceipt | null> {
+      const runJson = await apiJson({ url: `${apiRepositoryPath(identity.repository)}/actions/runs/${execution.workflowRunId}/artifacts?per_page=100`, budget, stage })
       const list = parseResponse(artifactListSchema, runJson.value, "artifact list")
       const expectedName = `ai-code-review-handoff-${execution.workflowRunId}-${execution.attempt}`
       const matches = list.artifacts.filter(({ name }) => name === expectedName)
@@ -670,7 +673,7 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
       return { id: artifact.id, name: artifact.name, workflowRunId: execution.workflowRunId, bytes: artifact.size_in_bytes, expired: artifact.expired, digest: null }
     },
 
-    async readFixedLines({ repository, sha, path, startLine, endLine, budget }): Promise<string> {
+    async readFixedLines({ repository, sha, path, startLine, endLine, budget, stage = "publish" }): Promise<string> {
       const commit = parseInput(gitShaSchema, sha, "fixed commit")
       const relative = parseInput(relativePathSchema, path, "fixed path")
       const first = parseInput(z.int().positive(), startLine, "start line")
@@ -680,19 +683,19 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
       try {
         const directory = join(parent, "repo.git")
         const env = gitEnvironment(await writeAskPassHelper(parent))
-        gitBytes({ args: ["init", "--bare", "--quiet", directory], env, budget, label: "bare repository init", failureCode: "snapshot-fetch" })
-        await fetchFixedObjects({ directory, env, budget, repository, objects: [commit] })
-        const entry = literalTreeEntry({ directory, env, budget, sha: commit, path: relative, label: "source ls-tree", failureCode: "snapshot-fetch" })
+        gitBytes({ args: ["init", "--bare", "--quiet", directory], env, budget, stage, label: "bare repository init", failureCode: "snapshot-fetch" })
+        await fetchFixedObjects({ directory, env, budget, stage, repository, objects: [commit] })
+        const entry = literalTreeEntry({ directory, env, budget, stage, sha: commit, path: relative, label: "source ls-tree", failureCode: "snapshot-fetch" })
         if (entry === null) throw new GitHubError(`${relative} is absent at the fixed commit`, "citation-invalid")
         if (entry.type !== "blob") throw new GitHubError(`${relative} is not a regular file at the fixed commit`, "citation-invalid")
         if (entry.mode !== "100644" && entry.mode !== "100755") {
           throw new GitHubError(`${relative} is not a regular file at the fixed commit`, "citation-invalid")
         }
-        const size = gitText({ args: ["-C", directory, "cat-file", "-s", entry.oid], env, budget, label: "source size", failureCode: "snapshot-fetch" })
+        const size = gitText({ args: ["-C", directory, "cat-file", "-s", entry.oid], env, budget, stage, label: "source size", failureCode: "snapshot-fetch" })
         if (!/^[0-9]+$/u.test(size) || Number(size) > FIXED_LINES_FILE_BYTE_LIMIT) {
           throw new GitHubError(`${relative} exceeds the per-file read cap`, "citation-invalid")
         }
-        const blob = gitBytes({ args: ["-C", directory, "cat-file", "blob", entry.oid], env, budget, label: "source blob", failureCode: "snapshot-fetch" })
+        const blob = gitBytes({ args: ["-C", directory, "cat-file", "blob", entry.oid], env, budget, stage, label: "source blob", failureCode: "snapshot-fetch" })
         let text: string
         try {
           text = strictDecoder.decode(blob)

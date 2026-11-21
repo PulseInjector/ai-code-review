@@ -7,12 +7,12 @@ import { GitHubError, credentialFreeGitEnvironment, type FixedRepository, type G
 import { runReview, type ReviewRun } from "./review"
 import { loadModelConfiguration } from "./runtime/worker-process"
 import type { DiscoveryWorker } from "./discovery"
+import { BudgetExhaustedError, withinDeadline, withinStage, workerPhaseDeadlines, WORKER_KILL_RESERVE_MS, type DeadlineResult } from "./budget"
 import {
-  phaseCheckpointSchema, prReviewResultSchema, reduceTerminalReview,
-  type Execution, type Failure, type PhaseCheckpoint, type PrOutcome, type PrReviewResult,
-  type PullRequestIdentity,
+  phaseCheckpointSchema, prReviewResultSchema, recoverableFailureCodes, reduceTerminalReview,
+  type Execution, type Failure, type PhaseCheckpoint, type PrOutcome, type PrReviewResult, type PullRequestIdentity,
 } from "./pr-contracts"
-import type { ReviewResult } from "./contracts"
+import { deriveKeepPublication, type Candidate, type ReviewResult, type Verification } from "./contracts"
 import { gitShaSchema, type GitSha, type Sha256 } from "./identity"
 import type { ExecutionBudget } from "./budget"
 import type { ProgressEvent, ProgressSink } from "./progress"
@@ -58,6 +58,7 @@ function failureFromLocalResult(result: ReviewResult): Failure {
 function classifyCaptureError(error: unknown): Failure {
   const message = boundedMessage(error)
   if (error instanceof GitHubError) return { code: error.code, stage: "capture", message }
+  if (error instanceof BudgetExhaustedError) return { code: "prepare-timeout", stage: "capture", message }
   return { code: "github-unavailable", stage: "capture", message }
 }
 
@@ -132,7 +133,7 @@ function boundedBackupBody(body: string): string {
 // receipt that keeps the classified failure code, and the bounded body copy is diagnostic only.
 async function readPreviousReportBackup(input: { identity: PullRequestIdentity; github: GitHubReader; budget: ExecutionBudget }): Promise<PreviousCommentBackup> {
   try {
-    const observation = await input.github.readProductComment({ identity: input.identity, budget: input.budget })
+    const observation = await withinStage(input.budget, "prepare-init", () => input.github.readProductComment({ identity: input.identity, budget: input.budget }))
     if (observation.kind === "absent") return { receipt: { kind: "absent" }, body: null }
     const bounded = boundedBackupBody(observation.canonical.body)
     return {
@@ -145,7 +146,7 @@ async function readPreviousReportBackup(input: { identity: PullRequestIdentity; 
       body: bounded,
     }
   } catch (error) {
-    const code = error instanceof GitHubError ? error.code : "github-unavailable"
+    const code = error instanceof GitHubError ? error.code : error instanceof BudgetExhaustedError ? "prepare-timeout" : "github-unavailable"
     return { receipt: backupReceiptSchema.parse({ kind: "unavailable", code }), body: null }
   }
 }
@@ -230,6 +231,33 @@ function checkpointFromRun(run: ReviewRun): PhaseCheckpoint {
   })
 }
 
+// A terminal runtime failure with finished, validated work becomes a partial review through the
+// same reducer as a clean run. The checkpoint comes from parent validation, never from array
+// lengths: a fully validated empty verification stays a verified checkpoint, and an interrupted
+// verification leaves zero current findings with every discovered candidate named unverified.
+function recoverablePartialFromRuntime(result: ReviewResult, data: NonNullable<ReviewRun["failure"]>): {
+  checkpoint: PhaseCheckpoint
+  result: PrReviewResult
+  pendingToolPages: number
+} {
+  const { candidates, verifications, failure, runtime, checkpoint } = data
+  const { published: issues, unpublishedCandidateIds } = deriveKeepPublication(candidates, verifications)
+  const keptIds = new Set(verifications.filter((verification) => verification.decision === "keep").map((verification) => verification.candidateId))
+  const unverifiedCandidateIds = candidates.filter((candidate) => !keptIds.has(candidate.id)).map((candidate) => candidate.id)
+  const { coverage } = boundCoverageForPublication({ ...result.coverage, unverifiedCandidateIds, unpublishedCandidateIds })
+  return {
+    checkpoint,
+    result: prReviewResultSchema.parse({
+      ...result,
+      status: "partial",
+      issues,
+      coverage,
+      stageErrors: [{ code: failure.code, stage: failure.stage, message: failure.message }],
+    }),
+    pendingToolPages: runtime?.readBudget.records.filter((record) => record.pending).length ?? 0,
+  }
+}
+
 // Segment 1 coverage names only inconclusive verifications as unverified, while the PR contract
 // names every candidate without an accepted keep and the checkpoint reducer owns that accounting.
 // The assembled PR result adopts the PR semantics and the publication bounds before reduction, so
@@ -254,10 +282,13 @@ function prResultFromRun(run: ReviewRun): PrReviewResult {
 
 export async function runPrReview(command: PrReviewCommand, deps: PrReviewDependencies): Promise<ReviewCommandOutcome> {
   const out = resolve(command.out)
-  if (await lstat(out).then(() => true, () => false)) {
-    throw new GitHubError("the output directory must be a new directory", "input-invalid")
-  }
-  await mkdir(out, { mode: 0o700 })
+  await withinStage(deps.budget, "prepare-init", async (signal) => {
+    if (await lstat(out).then(() => true, () => false)) {
+      throw new GitHubError("the output directory must be a new directory", "input-invalid")
+    }
+    signal.throwIfAborted()
+    await mkdir(out, { mode: 0o700 })
+  })
   const replayDirectory = join(out, "replay")
   const actionsExecution = deps.execution.kind === "actions" ? deps.execution : null
   const isActions = actionsExecution !== null
@@ -326,9 +357,9 @@ export async function runPrReview(command: PrReviewCommand, deps: PrReviewDepend
 
   emit("capture", "start")
   try {
-    captured = await deps.github.capturePullRequest({ repository: command.repository, pr: command.pr, budget: deps.budget })
+    captured = await withinStage(deps.budget, "prepare-init", () => deps.github.capturePullRequest({ repository: command.repository, pr: command.pr, budget: deps.budget }))
   } catch (error) {
-    if (!(error instanceof GitHubError)) throw error
+    if (!(error instanceof GitHubError || error instanceof BudgetExhaustedError)) throw error
     return failureOutcome(classifyCaptureError(error), out, false)
   }
   backup = await readPreviousReportBackup({ identity: captured.identity, github: deps.github, budget: deps.budget })
@@ -361,7 +392,16 @@ export async function runPrReview(command: PrReviewCommand, deps: PrReviewDepend
 
   let fixed: FixedRepository
   try {
-    fixed = await deps.github.prepareFixedRepository({ captured, configPath: command.config, budget: deps.budget })
+    const capturedPr = captured
+    fixed = await withinStage(deps.budget, "prepare-init", async (signal) => {
+      const prepared = await deps.github.prepareFixedRepository({ captured: capturedPr, configPath: command.config, budget: deps.budget })
+      if (signal.aborted || !deps.budget.canStartRequest("prepare-init", 1)) {
+        void prepared.dispose().catch(() => undefined)
+        deps.budget.assertRemaining("prepare-init")
+        signal.throwIfAborted()
+      }
+      return prepared
+    })
     configSource = fixed.configSource
   } catch (error) {
     return failureOutcome(classifyPreparationError(error), out, false)
@@ -369,6 +409,17 @@ export async function runPrReview(command: PrReviewCommand, deps: PrReviewDepend
 
   let run: ReviewRun
   let disposeFailure: Failure | null = null
+  // The parent boundary enforces the final deadline: fixed-repository cleanup after analysis is
+  // bounded by the run deadline, so a hung directory removal cannot carry the run past its
+  // budget, and the failure is recorded separately instead of discarding the analysis.
+  const finalEpochMs = workerPhaseDeadlines(deps.budget).finalEpochMs
+  const disposalDeadline = finalEpochMs - WORKER_KILL_RESERVE_MS
+  let disposal: Promise<DeadlineResult<void>> | undefined
+  const disposeFixedRepository = async (): Promise<void> => {
+    disposal ??= withinDeadline(() => fixed.dispose(), disposalDeadline)
+    if ((await disposal).kind === "timed-out") throw new Error("fixed repository cleanup exceeded the run deadline")
+  }
+  let terminalOutcome: PrOutcome | undefined
   try {
     // runReview receives the replay subdirectory, never <out> itself, the budget owns its
     // deadline from the first API call through cleanup, and the export children run Git in the
@@ -382,50 +433,35 @@ export async function runPrReview(command: PrReviewCommand, deps: PrReviewDepend
         progress: reviewProgress,
         getModelConfiguration: deps.model,
         gitEnvironment: credentialFreeGitEnvironment(),
+        finalizeReplay: async (preparedRun, signal) => {
+          try { await disposeFixedRepository() }
+          catch (error) { disposeFailure = { code: "cleanup-failed", stage: "cleanup", message: boundedMessage(error) } }
+          signal.throwIfAborted()
+          const outcome = reducePrRun(preparedRun, deps.execution, disposeFailure)
+          terminalOutcome = outcome
+          if (outcome.kind === "reviewed") return outcome.result
+          const result = preparedRun.artifacts.result
+          if (outcome.kind === "skipped") return result
+          return prReviewResultSchema.parse({ ...result, status: "failed", issues: [], stageErrors: [outcome.failure],
+            coverage: boundCoverageForPublication(result.coverage).coverage })
+        },
         ...(deps.attemptStartedAt !== undefined ? { attemptStartedAt: deps.attemptStartedAt } : {}),
         ...(deps.runWorker !== undefined ? { runWorker: deps.runWorker } : {}),
       },
     )
   } catch (error) {
     try {
-      await fixed.dispose()
+      await disposeFixedRepository()
     } catch {
       // The primary preparation failure already decides this outcome.
     }
-    return failureOutcome(classifyPreparationError(error), out, false)
-  }
-  try {
-    await fixed.dispose()
-  } catch (error) {
-    disposeFailure = { code: "cleanup-failed", stage: "cleanup", message: boundedMessage(error) }
+    if (terminalOutcome === undefined) return failureOutcome(classifyPreparationError(error), out, false)
+    return failureOutcome({ code: "artifact-write", stage: "handoff", message: boundedMessage(error) }, out, false)
   }
 
   const result = run.artifacts.result
-  let outcome: PrOutcome
-  if (result.status === "skipped") {
-    outcome = { kind: "skipped", reason: "no-changes", snapshot: result.snapshot }
-  } else if (result.status === "failed") {
-    outcome = { kind: "failed", failure: failureFromLocalResult(result), snapshot: result.snapshot }
-  } else {
-    // A disposal failure after fully validated analysis folds into terminal assembly: the
-    // verified work stays as a partial with retained keeps, and the red-job stage error rides it.
-    const assembled = prResultFromRun(run)
-    const resultForReduction = disposeFailure !== null
-      ? prReviewResultSchema.parse({ ...assembled, status: "partial" })
-      : assembled
-    const reduction = reduceTerminalReview({
-      execution: deps.execution,
-      checkpoint: checkpointFromRun(run),
-      result: resultForReduction,
-      ...(disposeFailure !== null ? { failure: disposeFailure } : {}),
-      pendingToolPages: pendingToolPages(run),
-    })
-    if (reduction.kind === "rejected") outcome = { kind: "failed", failure: reduction.failure, snapshot: result.snapshot }
-    else if (reduction.review.kind === "failed") outcome = { kind: "failed", failure: reduction.review.failure, snapshot: result.snapshot }
-    else outcome = { kind: "reviewed", result: reduction.review.result }
-  }
-  // The local result carries legacy unbranded SHAs; the branded parse keeps the captured snapshot
-  // type-checked against the handoff contract.
+  if (terminalOutcome === undefined) throw new Error("review did not assemble a terminal outcome")
+  const outcome = terminalOutcome
   const capturedSnapshot: CapturedSnapshot = {
     baseSha: captured.baseSha,
     headSha: captured.headSha,
@@ -453,4 +489,52 @@ export async function runPrReview(command: PrReviewCommand, deps: PrReviewDepend
     },
     exitCode: exitCodeFor(outcome),
   }
+}
+
+function reducePrRun(run: ReviewRun, execution: Execution, disposeFailure: Failure | null): PrOutcome {
+  const result = run.artifacts.result
+  let outcome: PrOutcome
+  if (result.status === "skipped") {
+    outcome = { kind: "skipped", reason: "no-changes", snapshot: result.snapshot }
+  } else if (result.status === "failed") {
+    const runtimeFailureData = run.failure
+    // The recoverable gate reads the validated checkpoint, not array lengths: a verified
+    // checkpoint with zero candidates is still completed work worth a partial, while kind none
+    // means no phase ever validated.
+    if (runtimeFailureData !== undefined && recoverableFailureCodes.has(runtimeFailureData.failure.code) && runtimeFailureData.checkpoint.kind !== "none") {
+      const recovered = recoverablePartialFromRuntime(result, runtimeFailureData)
+      const reduction = reduceTerminalReview({
+        execution,
+        checkpoint: recovered.checkpoint,
+        result: recovered.result,
+        failure: runtimeFailureData.failure,
+        pendingToolPages: recovered.pendingToolPages,
+      })
+      if (reduction.kind === "rejected") outcome = { kind: "failed", failure: reduction.failure, snapshot: result.snapshot }
+      else if (reduction.review.kind === "failed") outcome = { kind: "failed", failure: reduction.review.failure, snapshot: result.snapshot }
+      else outcome = { kind: "reviewed", result: reduction.review.result }
+    } else {
+      // Without validated work the typed failure stands on its own; a failure without a typed
+      // classification falls back to the conservative message patterns.
+      outcome = { kind: "failed", failure: runtimeFailureData?.failure ?? failureFromLocalResult(result), snapshot: result.snapshot }
+    }
+  } else {
+    // A disposal failure after fully validated analysis folds into terminal assembly: the
+    // verified work stays as a partial with retained keeps, and the red-job stage error rides it.
+    const assembled = prResultFromRun(run)
+    const resultForReduction = disposeFailure !== null
+      ? prReviewResultSchema.parse({ ...assembled, status: "partial" })
+      : assembled
+    const reduction = reduceTerminalReview({
+      execution,
+      checkpoint: checkpointFromRun(run),
+      result: resultForReduction,
+      ...(disposeFailure !== null ? { failure: disposeFailure } : {}),
+      pendingToolPages: pendingToolPages(run),
+    })
+    if (reduction.kind === "rejected") outcome = { kind: "failed", failure: reduction.failure, snapshot: result.snapshot }
+    else if (reduction.review.kind === "failed") outcome = { kind: "failed", failure: reduction.review.failure, snapshot: result.snapshot }
+    else outcome = { kind: "reviewed", result: reduction.review.result }
+  }
+  return outcome
 }

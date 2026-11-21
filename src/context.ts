@@ -1,4 +1,5 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
+import { renameSync } from "node:fs"
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises"
 import { basename, dirname, join, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { z } from "zod"
@@ -138,7 +139,7 @@ export async function loadReviewLimits(): Promise<ReviewLimits> {
   return reviewLimitsSchema.parse(JSON.parse(await readFile(productReviewConfigPath, "utf-8")))
 }
 
-export type PrepareContextOptions = { gitEnvironment?: Record<string, string> }
+export type PrepareContextOptions = { gitEnvironment?: Record<string, string>; signal?: AbortSignal }
 
 export async function prepareContext(input: ReviewInput, requestedLimits?: ReviewLimits, deadline = Date.now() + 300_000, options?: PrepareContextOptions): Promise<ContextManifest> {
   const limits = reviewLimitsSchema.parse(requestedLimits ?? await loadReviewLimits())
@@ -287,7 +288,9 @@ export async function prepareContext(input: ReviewInput, requestedLimits?: Revie
       ...(instructions ? { instructions } : {}),
     }
     await writeFile(join(staging, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" })
-    await rename(staging, out)
+    options?.signal?.throwIfAborted()
+    if (Date.now() >= deadline) throw new Error("review exceeded the run deadline during preparation")
+    renameSync(staging, out)
     committed = true
     return manifest
   } finally {
