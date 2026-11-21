@@ -13,7 +13,7 @@ test("verification CLI help lists its supported user entry points", async () => 
   const result = await invoke("--help")
   expect(result.exitCode).toBe(0)
   expect(result.stdout).toContain("bun run verify doctor [--live]")
-  expect(result.stdout).toContain("--area cli|snapshot|runtime|java")
+  expect(result.stdout).toContain("--area cli|snapshot|runtime|github|java")
 })
 
 test("verification CLI rejects unknown areas without creating evidence", async () => {

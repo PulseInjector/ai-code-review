@@ -9,7 +9,7 @@ Read this index before running a user-facing verification journey. The app is a 
 - The verification CLI creates isolated Git repositories and evidence under a fresh system temporary directory.
 - Never point a verification command at the user's active repository as a fixture or delete a directory that the run did not create.
 - Live model calls are excluded from local journeys. `bun run verify --live` is opt-in and can incur API charges.
-- The `review` and `publish` subcommand forms need an Actions execution context for a full dispatch. Drive their help and argument-rejection paths locally; their dispatch behavior is covered by the unit tests in the full suite until dedicated area journeys exist.
+- The `review` and `publish` subcommand forms need an Actions execution context for production dispatch. Area journeys cover their dispatcher behavior through injected adapters; they never contact a live GitHub or model service.
 
 ## Proof rules
 

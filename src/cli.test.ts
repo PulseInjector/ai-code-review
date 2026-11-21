@@ -85,7 +85,7 @@ test("help exits before reading credentials", async () => {
 test("the legacy local help text stays unchanged", async () => {
   const result = await invoke("--help")
   expect(result.exitCode).toBe(0)
-  expect(result.stdout).toBe("usage: bun run review -- --repo <path> --base <revision> --head <revision> --out <new-directory>\n")
+  expect(result.stdout).toBe("usage: bun run src/cli.ts --repo <path> --base <revision> --head <revision> --out <new-directory>\n")
 })
 
 test("invalid CLI input writes a sanitized error and no JSON summary", async () => {

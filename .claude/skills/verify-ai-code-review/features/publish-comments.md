@@ -21,7 +21,7 @@ The publish command runs inside the review workflow and reconciles exactly one o
 Preconditions:
 
 - `bun run verify doctor` passes.
-- This surface is driven by `bun test src/publish.test.ts src/comment.test.ts src/github.test.ts`, which the full `bun run verify` suite includes. Per the map's sync rule, this driving section changes in the commit that adds a dedicated area journey.
+- `bun run verify --area github` passes the `publish-comments` journey through the public dispatcher, injected publisher, and deterministic state renderer.
 
 - **Publication journeys.** The tests drive the production dispatcher with an injected publisher: a first publication creates one comment; a repeat of the same attempt and digest returns `already-published` with no write; a lost POST response retains the original comment ID after a re-list; an H2 race yields a stale annotation still bound to H1; a missing artifact yields an `artifact-missing` failure note; a corrupt package yields `rejected` with zero writes.
 - **Marker forgery.** The comment tests prove model text cannot open an HTML comment, forge the marker line, inject links, commands, or mentions, and that extra markers or state blocks make a comment invalid.

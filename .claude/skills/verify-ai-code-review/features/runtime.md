@@ -25,7 +25,7 @@ Preconditions:
 - Live checks require all four `REVIEW_MODEL_*` values from `ENVIRONMENT.md`; model connectivity is confirmed only by `--live`.
 
 - **Local timeout.** Run `bun run verify --area runtime`. The stalled local endpoint must receive a request, worker status must be `timeout`, usage must be `unknown`, the credential sentinel must not appear in artifacts, and the process group must be gone. The same area runs `smoke:sdk`; it must report a passed lifecycle and clean host close.
-- **Policy surfaces.** The area command does not run the request-policy or scripted-provider tests. When reviewing retry, admission, or provider-interaction changes, run them directly: `bun test src/runtime/request-policy.test.ts src/runtime/scripted-provider.test.ts`. They cover admission gating, the three-attempt cap, retry delays, the ledger cap, redirects, compaction, title calls, blocked `generate`, and same-session recovery.
+- **Policy surfaces.** The area command runs both request-policy and scripted-provider tests. They cover admission gating, the three-attempt cap, retry delays, the ledger cap, redirects, compaction, title calls, blocked `generate`, and same-session recovery.
 - **Live phases.** Run `bun run verify --live`. It runs `smoke:model`, then acceptance cases for defect, guarded, and incomplete coverage. Confirm the case statuses and retained reports; a failed model smoke causes acceptance to be skipped.
 
 ## Gotchas

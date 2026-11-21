@@ -20,7 +20,7 @@ Admission is the publisher's defense against a corrupted, stale, or forged hando
 Preconditions:
 
 - `bun run verify doctor` passes.
-- This surface is driven by `bun test src/handoff.test.ts src/publish.test.ts src/github.test.ts`, which the full `bun run verify` suite includes. Per the map's sync rule, this driving section changes in the commit that adds a dedicated area journey.
+- `bun run verify --area github` passes the `handoff-admission` journey through the public dispatcher and injected GitHub adapters.
 
 - **Valid admission.** The tests build a package with `writePrHandoff`, admit it against a matching in-progress workflow and one exact-name unexpired receipt, and assert `{ kind: "valid" }` with the expected result digest.
 - **Mutation cases.** Each mutation must reject with the right code: a third file, a symlink or hard link, one flipped result byte, a changed expected attempt, an expired receipt, two matching receipts, a completed workflow, a changed product commit, and a citation outside `changedHeadPaths`.

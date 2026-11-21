@@ -10,7 +10,7 @@
     "review": "bun run src/cli.ts",
     "verify": "bun run src/verification/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test src/comment.test.ts src/publish.test.ts src/identity.test.ts src/pr-contracts.test.ts src/handoff.test.ts src/contracts.test.ts src/fixtures/java-review.test.ts src/context.test.ts src/budget.test.ts src/discovery.test.ts src/report.test.ts src/review.test.ts src/github.test.ts src/pr-review.test.ts src/cli.test.ts src/runtime/runtime.test.ts src/runtime/request-policy.test.ts src/runtime/scripted-provider.test.ts src/runtime/worker-process.test.ts src/verification/cli.test.ts",
+    "test": "bun test src/action.test.ts src/action-entry.test.ts src/comment.test.ts src/publish.test.ts src/identity.test.ts src/pr-contracts.test.ts src/handoff.test.ts src/contracts.test.ts src/fixtures/java-review.test.ts src/context.test.ts src/budget.test.ts src/discovery.test.ts src/report.test.ts src/review.test.ts src/github.test.ts src/pr-review.test.ts src/cli.test.ts src/runtime/runtime.test.ts src/runtime/request-policy.test.ts src/runtime/scripted-provider.test.ts src/runtime/worker-process.test.ts src/verification/cli.test.ts",
     "check:post": "bun run scripts/check-postable.ts",
     "smoke:sdk": "bun run src/smoke/sdk-lifecycle.ts",
     "smoke:model": "bun run src/smoke/sdk-model.ts",
@@ -24,6 +24,7 @@
   },
   "devDependencies": {
     "@types/bun": "1.4.4",
+    "js-yaml": "3.15.2",
     "typescript": "7.0.2"
   }
 }

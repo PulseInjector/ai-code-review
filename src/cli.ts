@@ -17,7 +17,7 @@ export type Command =
 export function parseReviewInput(argv: string[]): ReviewInput {
   const args = argv[0] === "--" ? argv.slice(1) : argv
   if (args.includes("--help") || args.includes("-h")) {
-    throw new Error("usage: bun run review -- --repo <path> --base <revision> --head <revision> --out <new-directory>")
+    throw new Error("usage: bun run src/cli.ts --repo <path> --base <revision> --head <revision> --out <new-directory>")
   }
   const values = new Map<string, string>()
   for (let index = 0; index < args.length; index += 2) {
@@ -32,7 +32,7 @@ export function parseReviewInput(argv: string[]): ReviewInput {
   return { repo: values.get("--repo")!, base: values.get("--base")!, head: values.get("--head")!, out: values.get("--out")! }
 }
 
-const LOCAL_HELP = "usage: bun run review -- --repo <path> --base <revision> --head <revision> --out <new-directory>"
+const LOCAL_HELP = "usage: bun run src/cli.ts --repo <path> --base <revision> --head <revision> --out <new-directory>"
 const HELP = [LOCAL_HELP,
   "       bun run src/cli.ts review --repository <owner/name> --pr <number> [--config <path>] --out <new-directory>",
   "       bun run src/cli.ts publish --repository <owner/name> --pr <number> --package <directory> --review-job-result <result>"].join("\n")
