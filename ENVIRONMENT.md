@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- macOS is the current local development platform.
+- macOS is the local development platform. The reusable workflow runs on `ubuntu-24.04`.
 - Bun `1.4.4` runs TypeScript files directly and installs dependencies from `bun.lock`.
 - `@opencode/sdk` and `@opencode/plugin` are pinned to `2.2.7` in `package.json`.
 - `javac` and `java` must be available for the Java toolchain check.
@@ -118,3 +118,21 @@ bun run src/cli.ts publish --repository PulseInjector/java-review --pr 17 --pack
 The publisher validates the package, selects the lowest-ID owned bot comment, and checks the current PR before each report write. A lost create response triggers complete comment scans without another create in that invocation. A changed PR after a confirmed write gets a stale annotation that retains the covered commits. A failed freshness check gets an unconfirmed warning when the comment API remains available.
 
 The command prints one JSON summary with the publication result, comment ID, evidence directory, and exit code. `publish-result.json` records the checks, intended body digests, write intents, and failures. Actions runs place it in `publish-evidence` under the attempt's runner temporary directory. Missing artifacts, rejected packages, failed reviews, and failed publication exit `1`. Stale results and already published results exit `0`. Failure and skip notes retain the last usable report in a separate section.
+
+The deployed form of these commands is in [GitHub Action and reusable workflow](#github-action-and-reusable-workflow).
+
+## GitHub Action and reusable workflow
+
+The root `action.yml` is a composite Action. It accepts `mode` (`review` or `publish`), `config`, `pr`, and `model-api-key`. It installs Bun `1.4.4`, runs `bun install --frozen-lockfile --ignore-scripts` in the product directory, and runs `src/action-entry.ts`. The review mode receives the model key. The publish mode does not. The Action outputs `status`, `run-directory`, `handoff-directory`, `handoff-artifact`, `replay-artifact`, and `comment-id`.
+
+`.github/workflows/review.yml` is a `workflow_call` workflow. It accepts `pr`, `config`, `model-provider-id`, `model-base-url`, and `model-id`, plus the `model-api-key` secret. The workflow sets `permissions: {}`. The review job has `contents: read`, `pull-requests: read`, and `actions: read`. The publish job has `contents: read`, `pull-requests: write`, and `actions: read`. Only the review job receives the model secret.
+
+The workflow uses one concurrency group for the product, a repository, and a pull request, with `cancel-in-progress: false`. The review job uploads the handoff and replay artifacts with names that include the run ID and attempt, and keeps them for seven days. It uploads them even when the job fails. The publish job downloads only the current run's handoff and writes the summary comment.
+
+Callers pin the reusable workflow to a full commit SHA. The workflow pins the product Action to a full commit SHA in both jobs. The caller triggers are `opened`, `synchronize`, `reopened`, `ready_for_review`, and `edited`, plus a `workflow_dispatch` input for the pull request number. `renderCallerWorkflow` in `scripts/workflows.ts` generates `examples/caller.yml` from a workflow commit. Regenerate the example when the workflow commit changes.
+
+The workflow is the only comment writer for a repository and a pull request. A caller that runs another publisher outside the workflow breaks that guarantee. The publish command refuses local writes.
+
+If the canonical comment state is invalid, the publisher keeps the previous report and writes nothing. If a create response is lost, the publisher reads the comment list up to three times and never creates a second comment in the same invocation. A later run or a manual rerun updates the original comment. Full findings and traces stay in the run artifacts. The comment carries a bounded summary.
+
+A base branch update does not necessarily trigger the product event. Rerun the caller workflow manually with the pull request number after a base change. [docs/segment-2-design.md](docs/segment-2-design.md) records the publication freshness rules and the full failure analysis.
