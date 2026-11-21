@@ -135,7 +135,7 @@ export const phaseCheckpointSchema = z.discriminatedUnion("kind", [
 ])
 export type PhaseCheckpoint = z.infer<typeof phaseCheckpointSchema>
 
-const recoverableFailureCodes = new Set<Failure["code"]>([
+export const recoverableFailureCodes = new Set<Failure["code"]>([
   "retry-exhausted", "acceptance-unknown", "discovery-timeout", "verification-timeout",
   "run-interrupted", "read-budget", "request-budget", "cleanup-failed",
 ])

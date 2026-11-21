@@ -15,6 +15,13 @@ const workerOptionsSchema = workerInputSchema.omit({ configDirectory: true, dead
 }).refine((input) => input.cleanupGraceMs < input.timeoutMs, "cleanup grace must fit inside the run budget")
 export type WorkerOptions = z.input<typeof workerOptionsSchema>
 
+// The non-secret model identity resolves once at initialization so a zero-request run records
+// its configured model without ever loading the credential.
+export function loadModelIdentity(env: NodeJS.ProcessEnv = process.env) {
+  const model = modelSchema.parse({ providerID: env.REVIEW_MODEL_PROVIDER_ID, baseURL: env.REVIEW_MODEL_BASE_URL, modelID: env.REVIEW_MODEL_ID })
+  return { providerId: model.providerID, modelId: model.modelID }
+}
+
 export function loadModelConfiguration(env: NodeJS.ProcessEnv = process.env) {
   const model = modelSchema.parse({ providerID: env.REVIEW_MODEL_PROVIDER_ID, baseURL: env.REVIEW_MODEL_BASE_URL, modelID: env.REVIEW_MODEL_ID })
   const apiKey = z.string().trim().min(1).parse(env.REVIEW_MODEL_API_KEY)

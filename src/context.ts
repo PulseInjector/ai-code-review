@@ -4,13 +4,13 @@ import { fileURLToPath } from "node:url"
 import { z } from "zod"
 import { parseSnapshot, relativePathSchema, type Snapshot } from "./contracts"
 
-const limitsSchema = z.strictObject({
+export const reviewLimitsSchema = z.strictObject({
   maxChangedFiles: z.int().nonnegative(),
   maxPatchBytes: z.int().nonnegative(),
   maxSnapshotBytes: z.int().nonnegative(),
 })
 
-export type ReviewLimits = z.infer<typeof limitsSchema>
+export type ReviewLimits = z.infer<typeof reviewLimitsSchema>
 export type ReviewInput = { repo: string; base: string; head: string; out: string }
 export type OmissionReason = "unsafe-path" | "excluded-path" | "non-text" | "non-regular" | "changed-file-limit" | "patch-limit" | "snapshot-limit"
 export type FileEntry = {
@@ -47,12 +47,14 @@ type GitChange = { status: string; oldPath?: string; newPath?: string }
 const decoder = new TextDecoder("utf-8", { fatal: true })
 const pathSegment = (path: string) => path.split("/")
 const comparePath = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0
-const configPath = fileURLToPath(new URL("../review.config.json", import.meta.url))
+export const productReviewConfigPath = fileURLToPath(new URL("../review.config.json", import.meta.url))
 
-function git(repo: string, args: string[], deadline: number): Uint8Array {
-  const timeout = deadline - Date.now()
+function git(repo: string, args: string[], deadline: number, env?: Record<string, string>): Uint8Array {
+  // Bun requires an integer timeout, and epoch deadline arithmetic can produce fractions from a
+  // real monotonic budget, so the process boundary converts to a whole millisecond count.
+  const timeout = Math.floor(deadline - Date.now())
   if (timeout <= 0) throw new Error("review exceeded the run deadline during preparation")
-  const result = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe", timeout, killSignal: "SIGKILL" })
+  const result = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe", timeout, killSignal: "SIGKILL", ...(env !== undefined ? { env } : {}) })
   if (result.exitedDueToTimeout) throw new Error("Git command exceeded the remaining review deadline")
   if (result.exitCode !== 0) {
     const message = new TextDecoder().decode(result.stderr).trim()
@@ -61,13 +63,13 @@ function git(repo: string, args: string[], deadline: number): Uint8Array {
   return result.stdout
 }
 
-function gitText(repo: string, args: string[], deadline: number): string {
-  return decoder.decode(git(repo, args, deadline)).trim()
+function gitText(repo: string, args: string[], deadline: number, env?: Record<string, string>): string {
+  return decoder.decode(git(repo, args, deadline, env)).trim()
 }
 
-function resolveCommit(repo: string, ref: string, deadline: number): string {
+function resolveCommit(repo: string, ref: string, deadline: number, env?: Record<string, string>): string {
   if (!ref || ref.startsWith("-")) throw new Error("base and head must be Git revisions")
-  return gitText(repo, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], deadline)
+  return gitText(repo, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], deadline, env)
 }
 
 function nulFields(bytes: Uint8Array): string[] {
@@ -76,9 +78,9 @@ function nulFields(bytes: Uint8Array): string[] {
   return fields
 }
 
-function tree(repo: string, sha: string, deadline: number): Tree {
+function tree(repo: string, sha: string, deadline: number, env?: Record<string, string>): Tree {
   const result: Tree = new Map()
-  for (const row of nulFields(git(repo, ["ls-tree", "-r", "-l", "-z", "--full-tree", sha], deadline))) {
+  for (const row of nulFields(git(repo, ["ls-tree", "-r", "-l", "-z", "--full-tree", sha], deadline, env))) {
     const tab = row.indexOf("\t")
     const match = /^(\d{6}) +(blob|commit) +([0-9a-f]{40,64}) +(\d+|-)$/u.exec(row.slice(0, tab))
     if (tab < 0 || !match) throw new Error("invalid Git tree entry")
@@ -87,8 +89,8 @@ function tree(repo: string, sha: string, deadline: number): Tree {
   return result
 }
 
-function changes(repo: string, from: string, to: string, deadline: number): GitChange[] {
-  const fields = nulFields(git(repo, ["diff", "--name-status", "-z", "-M", "--no-ext-diff", "--no-textconv", from, to], deadline))
+function changes(repo: string, from: string, to: string, deadline: number, env?: Record<string, string>): GitChange[] {
+  const fields = nulFields(git(repo, ["diff", "--name-status", "-z", "-M", "--no-ext-diff", "--no-textconv", from, to], deadline, env))
   const result: GitChange[] = []
   for (let i = 0; i < fields.length;) {
     const status = fields[i++]!
@@ -116,9 +118,9 @@ function pathReason(path: string): OmissionReason | undefined {
   return undefined
 }
 
-function textBlob(repo: string, file: TreeFile, deadline: number): string | undefined {
+function textBlob(repo: string, file: TreeFile, deadline: number, env?: Record<string, string>): string | undefined {
   if (file.mode !== "100644" && file.mode !== "100755") return undefined
-  const bytes = git(repo, ["cat-file", "blob", file.oid], deadline)
+  const bytes = git(repo, ["cat-file", "blob", file.oid], deadline, env)
   if (bytes.includes(0)) return undefined
   try {
     const content = decoder.decode(bytes)
@@ -126,32 +128,35 @@ function textBlob(repo: string, file: TreeFile, deadline: number): string | unde
   } catch { return undefined }
 }
 
-function patchText(repo: string, from: string, to: string, change: GitChange, deadline: number): string {
+function patchText(repo: string, from: string, to: string, change: GitChange, deadline: number, env?: Record<string, string>): string {
   const paths = [change.oldPath, change.newPath].filter((path): path is string => path !== undefined)
   const literalPaths = paths.map((path) => `:(literal)${path}`)
-  return decoder.decode(git(repo, ["diff", "-M", "--no-ext-diff", "--no-textconv", "--no-color", "-U3", from, to, "--", ...literalPaths], deadline))
+  return decoder.decode(git(repo, ["diff", "-M", "--no-ext-diff", "--no-textconv", "--no-color", "-U3", from, to, "--", ...literalPaths], deadline, env))
 }
 
 export async function loadReviewLimits(): Promise<ReviewLimits> {
-  return limitsSchema.parse(JSON.parse(await readFile(configPath, "utf-8")))
+  return reviewLimitsSchema.parse(JSON.parse(await readFile(productReviewConfigPath, "utf-8")))
 }
 
-export async function prepareContext(input: ReviewInput, requestedLimits?: ReviewLimits, deadline = Date.now() + 300_000): Promise<ContextManifest> {
-  const limits = limitsSchema.parse(requestedLimits ?? await loadReviewLimits())
+export type PrepareContextOptions = { gitEnvironment?: Record<string, string> }
+
+export async function prepareContext(input: ReviewInput, requestedLimits?: ReviewLimits, deadline = Date.now() + 300_000, options?: PrepareContextOptions): Promise<ContextManifest> {
+  const limits = reviewLimitsSchema.parse(requestedLimits ?? await loadReviewLimits())
+  const gitEnv = options?.gitEnvironment
   const repo = await realpath(input.repo)
   if (!(await stat(repo)).isDirectory()) throw new Error("repo must be a directory")
   const requestedOut = resolve(input.out)
   const out = join(await realpath(dirname(requestedOut)), basename(requestedOut))
   if (out === repo || out.startsWith(`${repo}${sep}`)) throw new Error("out must be outside the repository")
   if (await lstat(out).then(() => true, () => false)) throw new Error("out must be a new directory")
-  const baseSha = resolveCommit(repo, input.base, deadline)
-  const headSha = resolveCommit(repo, input.head, deadline)
-  const mergeBaseSha = gitText(repo, ["merge-base", baseSha, headSha], deadline)
+  const baseSha = resolveCommit(repo, input.base, deadline, gitEnv)
+  const headSha = resolveCommit(repo, input.head, deadline, gitEnv)
+  const mergeBaseSha = gitText(repo, ["merge-base", baseSha, headSha], deadline, gitEnv)
   const snapshot = parseSnapshot({ baseSha, headSha, mergeBaseSha })
-  const baseTree = tree(repo, mergeBaseSha, deadline)
-  const inputBaseTree = baseSha === mergeBaseSha ? baseTree : tree(repo, baseSha, deadline)
-  const headTree = tree(repo, headSha, deadline)
-  const changed = changes(repo, mergeBaseSha, headSha, deadline)
+  const baseTree = tree(repo, mergeBaseSha, deadline, gitEnv)
+  const inputBaseTree = baseSha === mergeBaseSha ? baseTree : tree(repo, baseSha, deadline, gitEnv)
+  const headTree = tree(repo, headSha, deadline, gitEnv)
+  const changed = changes(repo, mergeBaseSha, headSha, deadline, gitEnv)
   const files: FileEntry[] = []
   const fileEntries = new Map<string, FileEntry>()
   for (const [side, source] of [["merge-base", baseTree], ["head", headTree]] as const) {
@@ -196,7 +201,7 @@ export async function prepareContext(input: ReviewInput, requestedLimits?: Revie
       const blob = (side === "merge-base" ? baseTree : headTree).get(path)!
       if (blob.mode !== "100644" && blob.mode !== "100755") return { reason: "non-regular" }
       if (blob.bytes > limits.maxSnapshotBytes) return { reason: "snapshot-limit" }
-      const content = textBlob(repo, blob, deadline)
+      const content = textBlob(repo, blob, deadline, gitEnv)
       if (content === undefined) return { reason: "non-text" }
       return { content }
     }
@@ -216,7 +221,7 @@ export async function prepareContext(input: ReviewInput, requestedLimits?: Revie
       if (reason || changedFiles >= limits.maxChangedFiles) {
         entry.reason = reason ?? "changed-file-limit"
       } else {
-        const patch = patchText(repo, mergeBaseSha, headSha, change, deadline)
+        const patch = patchText(repo, mergeBaseSha, headSha, change, deadline, gitEnv)
         const bytes = Buffer.byteLength(patch)
         const additional = assessed.filter(({ side, path }) => !written.has(`${side}/${path}`))
           .reduce((total, item) => total + Buffer.byteLength(item.content!), 0)
@@ -267,7 +272,7 @@ export async function prepareContext(input: ReviewInput, requestedLimits?: Revie
     const reviewFile = inputBaseTree.get("REVIEW.md")
     if (reviewFile) {
       if (reviewFile.mode === "100644" && reviewFile.bytes <= 16 * 1024) {
-        const text = textBlob(repo, reviewFile, deadline)
+        const text = textBlob(repo, reviewFile, deadline, gitEnv)
         if (text !== undefined) instructions = { sourceSha: baseSha, path: "REVIEW.md", text }
       }
       if (!instructions) omitted.add("REVIEW.md")

@@ -112,7 +112,7 @@ export function createRunArtifacts(options: {
 
 export async function writeRunArtifacts(runDirectory: string, artifacts: RunArtifacts, options: {
   discovery?: DiscoveryVerificationResult; runtime?: RuntimeResult; candidates?: Candidate[];
-  timing: { startedAt: string; deadline: string; preparationMs: number; analysisMs: number }
+  timing: { startedAt: string; deadline: string; preparationMs: number; analysisMs: number; attemptStartedAt?: string }
 }): Promise<void> {
   const runtime = options.discovery?.runtime ?? options.runtime
   const writes: Array<[string, string]> = [

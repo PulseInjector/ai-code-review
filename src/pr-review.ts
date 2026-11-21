@@ -1,0 +1,456 @@
+import { createHash } from "node:crypto"
+import { lstat, mkdir } from "node:fs/promises"
+import { join, resolve } from "node:path"
+import { z } from "zod"
+import { backupReceiptSchema } from "./handoff"
+import { GitHubError, credentialFreeGitEnvironment, type FixedRepository, type GitHubReader, type PullRequestCapture } from "./github"
+import { runReview, type ReviewRun } from "./review"
+import { loadModelConfiguration } from "./runtime/worker-process"
+import type { DiscoveryWorker } from "./discovery"
+import {
+  phaseCheckpointSchema, prReviewResultSchema, reduceTerminalReview,
+  type Execution, type Failure, type PhaseCheckpoint, type PrOutcome, type PrReviewResult,
+  type PullRequestIdentity,
+} from "./pr-contracts"
+import type { ReviewResult } from "./contracts"
+import { gitShaSchema, type GitSha, type Sha256 } from "./identity"
+import type { ExecutionBudget } from "./budget"
+import type { ProgressEvent, ProgressSink } from "./progress"
+
+const BACKUP_BODY_BYTE_LIMIT = 60_000
+const sha256 = (value: string | Uint8Array): Sha256 => createHash("sha256").update(value).digest("hex") as Sha256
+// Every failure message must satisfy the contract's one-line minimum, so an error carrying no
+// usable text still becomes a bounded, nonempty diagnostic instead of a schema violation.
+const boundedMessage = (error: unknown): string => {
+  const message = (error instanceof Error ? error.message : String(error)).slice(0, 2_000).trim()
+  return message === "" ? "the failure carried no message" : message
+}
+
+// Checkpoint 2 maps a failed local result onto the closed PR failure enum from its stage error
+// text. Checkpoint 3's runtime terminal error classifier owns the authoritative mapping through
+// typed worker checkpoints, so these ordered patterns stay conservative.
+function classifyStageError(stage: string, message: string): Failure {
+  const prStage: Failure["stage"] = stage === "input" ? "input"
+    : stage === "preparation" ? "preparation"
+    : stage === "verification" ? "verification"
+    : stage === "report" ? "handoff"
+    : "discovery"
+  const failure = (code: Failure["code"]): Failure => ({ code, stage: prStage, message: message.slice(0, 2_000) })
+  if (/deadline|timed? ?out|exceeded the run/iu.test(message)) {
+    return failure(prStage === "discovery" ? "discovery-timeout" : prStage === "verification" ? "verification-timeout" : "prepare-timeout")
+  }
+  if (/interrupted|signal/iu.test(message)) return failure("run-interrupted")
+  if (/401|unauthorized|api key|authentication/iu.test(message)) return failure("model-auth")
+  if (/refus/iu.test(message)) return failure("model-refusal")
+  if (/REVIEW_MODEL_|base ?url|provider|model id/iu.test(message)) return failure("model-config")
+  if (/close|host/iu.test(message)) return failure("cleanup-failed")
+  if (/line range|excerpt|citation|snapshot:/iu.test(message)) return failure("citation-invalid")
+  if (/candidate/iu.test(message)) return failure("candidate-set-invalid")
+  return failure("model-format")
+}
+
+function failureFromLocalResult(result: ReviewResult): Failure {
+  const error = result.stageErrors[0]
+  if (error === undefined) return { code: "model-format", stage: "verification", message: "the local review failed without a recorded stage error" }
+  return classifyStageError(error.stage, error.message)
+}
+
+function classifyCaptureError(error: unknown): Failure {
+  const message = boundedMessage(error)
+  if (error instanceof GitHubError) return { code: error.code, stage: "capture", message }
+  return { code: "github-unavailable", stage: "capture", message }
+}
+
+function classifyPreparationError(error: unknown): Failure {
+  const message = boundedMessage(error)
+  if (error instanceof GitHubError) return { code: error.code, stage: "preparation", message }
+  if (/deadline|exceeded the run/iu.test(message)) return { code: "prepare-timeout", stage: "preparation", message }
+  return { code: "snapshot-fetch", stage: "preparation", message }
+}
+
+export type PrReviewCommand = { repository: string; pr: number; config: string; out: string }
+
+export type PrReviewDependencies = {
+  github: GitHubReader
+  execution: Execution
+  progress: ProgressSink
+  // The non-secret model identity resolves once at initialization. The credential getter is
+  // separate and lazy, so a draft, closed, fork, or all-omitted run never requires a model key.
+  modelIdentity: () => { providerId: string; modelId: string }
+  model: () => ReturnType<typeof loadModelConfiguration>
+  budget: ExecutionBudget
+  attemptStartedAt?: string
+  runWorker?: DiscoveryWorker
+}
+
+export type PreviousCommentBackup = { receipt: z.infer<typeof backupReceiptSchema>; body: string | null }
+
+export type CapturedSnapshot = { baseSha: GitSha; headSha: GitSha; mergeBaseSha: GitSha | null; observedAt: string }
+
+// The structured values writePrHandoff will need at checkpoint 4. Checkpoint 2 returns them
+// instead of writing handoff files.
+export type PrHandoffInput = {
+  identity: PullRequestIdentity | null
+  execution: Execution
+  captured: CapturedSnapshot | null
+  outcome: PrOutcome
+  backup: z.infer<typeof backupReceiptSchema>
+  backupBody: string | null
+  configSource: FixedRepository["configSource"] | null
+  model: { providerId: string; modelId: string } | null
+  artifactName: string | null
+  replayArtifactName: string | null
+  completedAt: string
+  replayDirectory: string | null
+}
+
+export type ReviewCommandOutcome = {
+  outcome: PrOutcome
+  runDirectory: string
+  handoffDirectory: string | null
+  artifactName: string | null
+  handoff: PrHandoffInput
+  exitCode: 0 | 1
+}
+
+// The backup keeps at most 60,000 bytes of the canonical owned body. Truncation cuts at a UTF-8
+// code-point boundary, so re-encoding the saved body never emits replacement bytes that push it
+// past the cap, and the receipt digest always covers the exact saved bytes.
+function boundedBackupBody(body: string): string {
+  const bytes = Buffer.from(body, "utf8")
+  if (bytes.byteLength <= BACKUP_BODY_BYTE_LIMIT) return body
+  let end = BACKUP_BODY_BYTE_LIMIT
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1
+  const bounded = bytes.subarray(0, end).toString("utf8")
+  if (Buffer.byteLength(bounded, "utf8") > BACKUP_BODY_BYTE_LIMIT) {
+    throw new Error("the bounded backup body exceeded its byte cap")
+  }
+  return bounded
+}
+
+// Backup access never changes analysis completeness: a read failure degrades to an unavailable
+// receipt that keeps the classified failure code, and the bounded body copy is diagnostic only.
+async function readPreviousReportBackup(input: { identity: PullRequestIdentity; github: GitHubReader; budget: ExecutionBudget }): Promise<PreviousCommentBackup> {
+  try {
+    const observation = await input.github.readProductComment({ identity: input.identity, budget: input.budget })
+    if (observation.kind === "absent") return { receipt: { kind: "absent" }, body: null }
+    const bounded = boundedBackupBody(observation.canonical.body)
+    return {
+      receipt: backupReceiptSchema.parse({
+        kind: "captured",
+        commentId: observation.canonical.id,
+        bodyDigest: sha256(bounded),
+        updatedAt: observation.canonical.updatedAt,
+      }),
+      body: bounded,
+    }
+  } catch (error) {
+    const code = error instanceof GitHubError ? error.code : "github-unavailable"
+    return { receipt: backupReceiptSchema.parse({ kind: "unavailable", code }), body: null }
+  }
+}
+
+// A stage interruption or cleanup failure leaves the job red even when its partial report is
+// usable, while a read or request cap alone is advisory coverage.
+const redJobFailureCodes = new Set<Failure["code"]>([
+  "retry-exhausted", "acceptance-unknown", "discovery-timeout", "verification-timeout",
+  "run-interrupted", "cleanup-failed",
+])
+
+function exitCodeFor(outcome: PrOutcome): 0 | 1 {
+  if (outcome.kind === "failed") return 1
+  if (outcome.kind === "skipped") return 0
+  return outcome.result.stageErrors.some((error) => redJobFailureCodes.has(error.code)) ? 1 : 0
+}
+
+const COVERAGE_PUBLICATION_CAPS = {
+  includedPaths: 2_000,
+  omittedPaths: 2_000,
+  unverifiedCandidateIds: 8,
+  unpublishedCandidateIds: 8,
+  notes: 128,
+} as const
+type CoverageKind = keyof typeof COVERAGE_PUBLICATION_CAPS
+
+// The PR publication schema bounds the coverage arrays. Overflow never fails the run or truncates
+// silently: each overflowing kind records its exact dropped-entry count as an omitted coverage
+// description, the omitted-path array reserves a slot for every description before slicing, and
+// the status becomes partial. A non-overflowing omitted array that descriptions would push over
+// its own cap overflows in its own right, so the reservation accounts for that case too. The
+// complete inventory stays in the replay context manifest the caller already receives.
+export function boundCoverageForPublication(coverage: ReviewResult["coverage"] & { unverifiedCandidateIds: string[] }): {
+  coverage: PrReviewResult["coverage"]
+  truncated: boolean
+} {
+  const kinds = Object.keys(COVERAGE_PUBLICATION_CAPS) as CoverageKind[]
+  const overflowKinds = kinds.filter((kind) => kind !== "omittedPaths" && coverage[kind].length > COVERAGE_PUBLICATION_CAPS[kind])
+  const omittedPushedOver = coverage.omittedPaths.length + overflowKinds.length > COVERAGE_PUBLICATION_CAPS.omittedPaths
+  const descriptions = overflowKinds.length + (omittedPushedOver ? 1 : 0)
+  if (descriptions === 0) {
+    return {
+      coverage: {
+        includedPaths: coverage.includedPaths,
+        omittedPaths: coverage.omittedPaths,
+        unverifiedCandidateIds: coverage.unverifiedCandidateIds,
+        unpublishedCandidateIds: coverage.unpublishedCandidateIds,
+        notes: coverage.notes,
+      },
+      truncated: false,
+    }
+  }
+  const omittedRoom = COVERAGE_PUBLICATION_CAPS.omittedPaths - descriptions
+  const bounded: Record<CoverageKind, string[]> = {
+    includedPaths: coverage.includedPaths,
+    omittedPaths: coverage.omittedPaths.slice(0, omittedRoom),
+    unverifiedCandidateIds: coverage.unverifiedCandidateIds,
+    unpublishedCandidateIds: coverage.unpublishedCandidateIds,
+    notes: coverage.notes,
+  }
+  for (const kind of overflowKinds) {
+    const cap = COVERAGE_PUBLICATION_CAPS[kind]
+    bounded[kind] = coverage[kind].slice(0, cap)
+    bounded.omittedPaths.push(`${coverage[kind].length - cap} ${kind} entries beyond the ${cap}-entry publication cap are recorded only in the replay manifest`)
+  }
+  if (omittedPushedOver) {
+    bounded.omittedPaths.push(`${coverage.omittedPaths.length - omittedRoom} omittedPaths entries beyond the 2000-entry publication cap are recorded only in the replay manifest`)
+  }
+  return { coverage: bounded, truncated: true }
+}
+
+function pendingToolPages(run: ReviewRun): number {
+  return run.discovery?.runtime.readBudget.records.filter((record) => record.pending).length ?? 0
+}
+
+function checkpointFromRun(run: ReviewRun): PhaseCheckpoint {
+  if (run.discovery === undefined) return { kind: "none" }
+  return phaseCheckpointSchema.parse({
+    kind: "verified",
+    discovery: { candidates: run.discovery.candidates },
+    verification: { verifications: run.discovery.verifications },
+  })
+}
+
+// Segment 1 coverage names only inconclusive verifications as unverified, while the PR contract
+// names every candidate without an accepted keep and the checkpoint reducer owns that accounting.
+// The assembled PR result adopts the PR semantics and the publication bounds before reduction, so
+// a guarded review that rejected a candidate is an honest partial rather than a rejected complete.
+function prResultFromRun(run: ReviewRun): PrReviewResult {
+  const result = run.artifacts.result
+  const unverifiedCandidateIds = run.discovery === undefined
+    ? result.coverage.unverifiedCandidateIds
+    : run.discovery.candidates
+      .filter((candidate) => !run.discovery!.verifications.some((verification) => verification.decision === "keep" && verification.candidateId === candidate.id))
+      .map((candidate) => candidate.id)
+  const { coverage, truncated } = boundCoverageForPublication({ ...result.coverage, unverifiedCandidateIds })
+  const clean = !truncated && pendingToolPages(run) === 0 && result.stageErrors.length === 0 &&
+    coverage.unverifiedCandidateIds.length === 0 && coverage.unpublishedCandidateIds.length === 0 &&
+    coverage.omittedPaths.length === 0
+  return prReviewResultSchema.parse({
+    ...result,
+    status: clean ? "complete" : "partial",
+    coverage,
+  })
+}
+
+export async function runPrReview(command: PrReviewCommand, deps: PrReviewDependencies): Promise<ReviewCommandOutcome> {
+  const out = resolve(command.out)
+  if (await lstat(out).then(() => true, () => false)) {
+    throw new GitHubError("the output directory must be a new directory", "input-invalid")
+  }
+  await mkdir(out, { mode: 0o700 })
+  const replayDirectory = join(out, "replay")
+  const actionsExecution = deps.execution.kind === "actions" ? deps.execution : null
+  const isActions = actionsExecution !== null
+  const artifactName = actionsExecution !== null ? `ai-code-review-handoff-${actionsExecution.workflowRunId}-${actionsExecution.attempt}` : null
+  const replayArtifactName = actionsExecution !== null ? `ai-code-review-replay-${actionsExecution.workflowRunId}-${actionsExecution.attempt}` : null
+  const runUrl = actionsExecution !== null ? actionsExecution.runUrl : null
+  let sequence = 0
+  const emit = (phase: ProgressEvent["phase"], event: ProgressEvent["event"]): void => {
+    deps.progress({
+      runId: deps.execution.reviewRunId,
+      sequence: sequence++,
+      at: new Date().toISOString(),
+      phase,
+      event,
+      changedFilesIncluded: null,
+      changedFilesTotal: null,
+      candidatesDiscovered: null,
+      candidatesVerified: null,
+      remainingMs: Math.max(0, deps.budget.remainingMs()),
+      runUrl,
+    })
+  }
+  // One sequencer owns every event of this run, so runReview's own emission is resequenced
+  // instead of starting a second counter.
+  const reviewProgress: ProgressSink = (event) => deps.progress({ ...event, sequence: sequence++ })
+
+  // The model record captures configured identity, resolved once at initialization from the
+  // non-secret model settings. An Actions execution always carries it, so resolution failure
+  // fails the run; the credential itself loads only after export proves included changes exist.
+  let modelRecord: { providerId: string; modelId: string } | null = null
+  let captured: PullRequestCapture | null = null
+  let configSource: FixedRepository["configSource"] | null = null
+  let backup: PreviousCommentBackup = { receipt: { kind: "absent" }, body: null }
+  const failureOutcome = (failure: Failure, runDirectory: string, replayRan: boolean): ReviewCommandOutcome => {
+    const outcome: PrOutcome = { kind: "failed", failure, snapshot: null }
+    return {
+      outcome,
+      runDirectory,
+      handoffDirectory: null,
+      artifactName,
+      handoff: {
+        identity: captured?.identity ?? null,
+        execution: deps.execution,
+        captured: captured === null ? null : { baseSha: captured.baseSha, headSha: captured.headSha, mergeBaseSha: null, observedAt: captured.observedAt },
+        outcome,
+        backup: backup.receipt,
+        backupBody: backup.body,
+        configSource,
+        model: modelRecord,
+        artifactName,
+        replayArtifactName,
+        completedAt: new Date().toISOString(),
+        replayDirectory: replayRan ? replayDirectory : null,
+      },
+      exitCode: 1,
+    }
+  }
+
+  try {
+    modelRecord = deps.modelIdentity()
+  } catch (error) {
+    if (isActions) {
+      return failureOutcome({ code: "model-config", stage: "initialization", message: boundedMessage(error) }, out, false)
+    }
+  }
+
+  emit("capture", "start")
+  try {
+    captured = await deps.github.capturePullRequest({ repository: command.repository, pr: command.pr, budget: deps.budget })
+  } catch (error) {
+    if (!(error instanceof GitHubError)) throw error
+    return failureOutcome(classifyCaptureError(error), out, false)
+  }
+  backup = await readPreviousReportBackup({ identity: captured.identity, github: deps.github, budget: deps.budget })
+  emit("capture", "end")
+
+  if (captured.eligibility.kind === "skip") {
+    const outcome: PrOutcome = { kind: "skipped", reason: captured.eligibility.reason, snapshot: null }
+    return {
+      outcome,
+      runDirectory: out,
+      handoffDirectory: null,
+      artifactName,
+      handoff: {
+        identity: captured.identity,
+        execution: deps.execution,
+        captured: { baseSha: captured.baseSha, headSha: captured.headSha, mergeBaseSha: null, observedAt: captured.observedAt },
+        outcome,
+        backup: backup.receipt,
+        backupBody: backup.body,
+        configSource: null,
+        model: modelRecord,
+        artifactName,
+        replayArtifactName,
+        completedAt: new Date().toISOString(),
+        replayDirectory: null,
+      },
+      exitCode: 0,
+    }
+  }
+
+  let fixed: FixedRepository
+  try {
+    fixed = await deps.github.prepareFixedRepository({ captured, configPath: command.config, budget: deps.budget })
+    configSource = fixed.configSource
+  } catch (error) {
+    return failureOutcome(classifyPreparationError(error), out, false)
+  }
+
+  let run: ReviewRun
+  let disposeFailure: Failure | null = null
+  try {
+    // runReview receives the replay subdirectory, never <out> itself, the budget owns its
+    // deadline from the first API call through cleanup, and the export children run Git in the
+    // credential-free environment.
+    run = await runReview(
+      { repo: fixed.directory, base: captured.baseSha, head: captured.headSha, out: replayDirectory },
+      {
+        budget: deps.budget,
+        runId: deps.execution.reviewRunId,
+        limits: fixed.config,
+        progress: reviewProgress,
+        getModelConfiguration: deps.model,
+        gitEnvironment: credentialFreeGitEnvironment(),
+        ...(deps.attemptStartedAt !== undefined ? { attemptStartedAt: deps.attemptStartedAt } : {}),
+        ...(deps.runWorker !== undefined ? { runWorker: deps.runWorker } : {}),
+      },
+    )
+  } catch (error) {
+    try {
+      await fixed.dispose()
+    } catch {
+      // The primary preparation failure already decides this outcome.
+    }
+    return failureOutcome(classifyPreparationError(error), out, false)
+  }
+  try {
+    await fixed.dispose()
+  } catch (error) {
+    disposeFailure = { code: "cleanup-failed", stage: "cleanup", message: boundedMessage(error) }
+  }
+
+  const result = run.artifacts.result
+  let outcome: PrOutcome
+  if (result.status === "skipped") {
+    outcome = { kind: "skipped", reason: "no-changes", snapshot: result.snapshot }
+  } else if (result.status === "failed") {
+    outcome = { kind: "failed", failure: failureFromLocalResult(result), snapshot: result.snapshot }
+  } else {
+    // A disposal failure after fully validated analysis folds into terminal assembly: the
+    // verified work stays as a partial with retained keeps, and the red-job stage error rides it.
+    const assembled = prResultFromRun(run)
+    const resultForReduction = disposeFailure !== null
+      ? prReviewResultSchema.parse({ ...assembled, status: "partial" })
+      : assembled
+    const reduction = reduceTerminalReview({
+      execution: deps.execution,
+      checkpoint: checkpointFromRun(run),
+      result: resultForReduction,
+      ...(disposeFailure !== null ? { failure: disposeFailure } : {}),
+      pendingToolPages: pendingToolPages(run),
+    })
+    if (reduction.kind === "rejected") outcome = { kind: "failed", failure: reduction.failure, snapshot: result.snapshot }
+    else if (reduction.review.kind === "failed") outcome = { kind: "failed", failure: reduction.review.failure, snapshot: result.snapshot }
+    else outcome = { kind: "reviewed", result: reduction.review.result }
+  }
+  // The local result carries legacy unbranded SHAs; the branded parse keeps the captured snapshot
+  // type-checked against the handoff contract.
+  const capturedSnapshot: CapturedSnapshot = {
+    baseSha: captured.baseSha,
+    headSha: captured.headSha,
+    mergeBaseSha: gitShaSchema.parse(result.snapshot.mergeBaseSha),
+    observedAt: captured.observedAt,
+  }
+  return {
+    outcome,
+    runDirectory: replayDirectory,
+    handoffDirectory: null,
+    artifactName,
+    handoff: {
+      identity: captured.identity,
+      execution: deps.execution,
+      captured: capturedSnapshot,
+      outcome,
+      backup: backup.receipt,
+      backupBody: backup.body,
+      configSource,
+      model: modelRecord,
+      artifactName,
+      replayArtifactName,
+      completedAt: new Date().toISOString(),
+      replayDirectory,
+    },
+    exitCode: exitCodeFor(outcome),
+  }
+}

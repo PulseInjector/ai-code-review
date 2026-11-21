@@ -195,6 +195,10 @@ export function deriveKeepPublication(candidates: readonly Candidate[], verifica
   }
 }
 
+// An empty file has zero lines, and a trailing newline does not add one.
+export const splitLines = (source: string): string[] =>
+  source === "" ? [] : source.replace(/\r?\n$/u, "").split(/\r?\n/u)
+
 export const parseSnapshot = (value: unknown): Snapshot => snapshotSchema.parse(value)
 export const parseCandidate = (value: unknown): Candidate => candidateSchema.parse(value)
 export const parseDiscoveryOutput = (value: unknown): DiscoveryOutput => discoveryOutputSchema.parse(value)

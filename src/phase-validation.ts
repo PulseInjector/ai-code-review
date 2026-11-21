@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises"
 import { isAbsolute, relative, resolve, sep } from "node:path"
-import { parseDiscoveryOutput, parseVerificationOutput, type Candidate, type CodeReference, type Verification } from "./contracts"
+import { parseDiscoveryOutput, parseVerificationOutput, splitLines, type Candidate, type CodeReference, type Verification } from "./contracts"
 import type { PhaseValidation } from "./runtime/contracts"
 
 function within(root: string, target: string): boolean {
@@ -16,7 +16,7 @@ async function validateReference(reference: CodeReference, validation: PhaseVali
   const path = resolve(root, reference.side, reference.path)
   if (!within(root, path)) throw new Error(`citation path escapes the prepared snapshot: ${reference.path}`)
   const source = await readFile(path, "utf8")
-  const lines = source === "" ? [] : source.replace(/\r?\n$/u, "").split(/\r?\n/u)
+  const lines = splitLines(source)
   if (reference.endLine > lines.length) throw new Error(`citation line range is outside ${reference.path}`)
   if (lines.slice(reference.startLine - 1, reference.endLine).join("\n").trim() !== reference.excerpt.trim()) {
     throw new Error(`citation excerpt does not match ${reference.path}:${reference.startLine}-${reference.endLine}`)
