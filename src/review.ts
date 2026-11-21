@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto"
-import { readFile, readdir } from "node:fs/promises"
+import { readFile } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import { z } from "zod"
 import { prepareContext, type ContextManifest, type ReviewInput, type ReviewLimits } from "./context"
@@ -11,16 +11,9 @@ import type { ProgressEvent, ProgressSink } from "./progress"
 import { defaultReadLimits, type PhaseDeadlines, type RuntimeResult } from "./runtime/contracts"
 import { loadModelConfiguration, RUNTIME_TIMEOUT_MS } from "./runtime/worker-process"
 import { createRunArtifacts, writeRunArtifacts, type RunArtifacts } from "./report"
+import { hashProductSources } from "./product-identity"
 
 const packagePath = new URL("../package.json", import.meta.url)
-
-async function programHash(signal: AbortSignal): Promise<string> {
-  const hash = createHash("sha256")
-  for (const path of (await readdir(import.meta.dir, { recursive: true })).filter((path) => path.endsWith(".ts")).sort()) {
-    hash.update(path).update("\0").update(await readFile(join(import.meta.dir, path), { signal })).update("\0")
-  }
-  return hash.digest("hex")
-}
 
 export type ReviewRun = {
   artifacts: RunArtifacts
@@ -77,7 +70,7 @@ export async function runReview(input: ReviewInput, options: ReviewOptions = {})
   const includedChanges = (context: ContextManifest) => context.changes.filter(({ included }) => included).length
   // Program evidence is staged before any model work, so the final write reserve never has to
   // carry hashing or package reads alongside the artifact writes.
-  const prepared = await withinDeadline((signal) => Promise.all([readFile(packagePath, { encoding: "utf8", signal }), programHash(signal)]), phaseDeadlines.prepareInitEpochMs)
+  const prepared = await withinDeadline((signal) => Promise.all([readFile(packagePath, { encoding: "utf8", signal }), hashProductSources(signal)]), phaseDeadlines.prepareInitEpochMs)
   if (prepared.kind === "timed-out") throw new BudgetExhaustedError("review exceeded the run deadline during preparation", "prepare-init")
   const [pkg, programVersion] = prepared.value
   const pkgJson = z.object({ dependencies: z.object({ "@opencode/sdk": z.string() }) }).parse(JSON.parse(pkg))

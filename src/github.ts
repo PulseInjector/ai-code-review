@@ -173,6 +173,7 @@ export type CommentObservation =
   | { kind: "owned"; canonical: ProductComment; duplicateIds: string[]; humanMarkerIds: string[] }
 export type ArtifactReceipt = { id: string; name: string; workflowRunId: string; bytes: number; expired: boolean; digest: Sha256 | null }
 export type SourceLineRequest = { sha: GitSha; path: string; startLine: number; endLine: number }
+export type FixedSnapshotEvidence = { mergeBaseSha: GitSha; changedHeadPaths: string[] }
 
 export interface GitHubReader {
   capturePullRequest(input: { repository: string; pr: number; budget: ExecutionBudget; stage?: Stage }): Promise<PullRequestCapture>
@@ -180,6 +181,7 @@ export interface GitHubReader {
   prepareFixedRepository(input: { captured: PullRequestCapture; configPath: string; budget: ExecutionBudget; stage?: Stage }): Promise<FixedRepository>
   readProductComment(input: { identity: PullRequestIdentity; budget: ExecutionBudget; stage?: Stage }): Promise<CommentObservation>
   readArtifactReceipt(input: { identity: PullRequestIdentity; execution: ActionsExecution; budget: ExecutionBudget; stage?: Stage }): Promise<ArtifactReceipt | null>
+  readFixedSnapshot(input: { identity: PullRequestIdentity; baseSha: GitSha; headSha: GitSha; budget: ExecutionBudget; stage?: Stage }): Promise<FixedSnapshotEvidence>
   readFixedLines(input: SourceLineRequest & { repository: string; budget: ExecutionBudget; stage?: Stage }): Promise<string>
 }
 
@@ -594,6 +596,34 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
       } catch (error) {
         await release().catch(() => undefined)
         throw error
+      }
+    },
+
+    async readFixedSnapshot({ identity, baseSha, headSha, budget, stage = "publish" }): Promise<FixedSnapshotEvidence> {
+      const base = parseInput(gitShaSchema, baseSha, "fixed base commit")
+      const head = parseInput(gitShaSchema, headSha, "fixed head commit")
+      const parent = await mkdtemp(join(tmpdir(), "ai-code-review-snapshot-"))
+      try {
+        const directory = join(parent, "repo.git")
+        const env = gitEnvironment(await writeAskPassHelper(parent))
+        gitBytes({ args: ["init", "--bare", "--quiet", directory], env, budget, stage, label: "bare repository init", failureCode: "snapshot-fetch" })
+        await fetchFixedObjects({ directory, env, budget, stage, repository: identity.repository, objects: [base, head] })
+        const mergeBase = gitText({
+          args: ["-C", directory, "merge-base", base, head], env, budget, stage,
+          label: "fixed merge-base computation", failureCode: "snapshot-fetch",
+        })
+        if (mergeBase === "") throw new GitHubError("the fixed base and head share no merge base", "snapshot-fetch")
+        const changed = gitBytes({
+          args: ["-C", directory, "diff", "--name-only", "--diff-filter=ACMRT", "-z", mergeBase, head],
+          env, budget, stage, label: "fixed changed-path listing", failureCode: "snapshot-fetch",
+        })
+        const paths = strictDecoder.decode(changed).split("\0").filter((path) => path !== "")
+        return {
+          mergeBaseSha: parseInput(gitShaSchema, mergeBase, "computed merge base"),
+          changedHeadPaths: paths.map((path) => parseInput(relativePathSchema, path, "changed head path")),
+        }
+      } finally {
+        await rm(parent, { recursive: true, force: true })
       }
     },
 

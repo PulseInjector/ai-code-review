@@ -1,9 +1,17 @@
 import { expect, test } from "bun:test"
 import { createHash } from "node:crypto"
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { createBudget, systemClock } from "./budget"
+import { GitHubError, type GitHubReader } from "./github"
+import { digestSchema, gitShaSchema, runIdSchema } from "./identity"
+import { actionsExecutionSchema, identitySchema, prOutcomeSchema, type PullRequestIdentity } from "./pr-contracts"
+import { hashProductSources, hashPromptTemplates } from "./product-identity"
 import {
-  backupReceiptSchema, HANDOFF_MANIFEST_BYTE_LIMIT, HANDOFF_RESULT_BYTE_LIMIT, modelRecordSchema,
-  resultReceiptSchema, reviewResultFileSchema, runManifestFileSchema, serializeHandoffFile,
-  validateHandoffRecords,
+  admitHandoff, backupReceiptSchema, HANDOFF_MANIFEST_BYTE_LIMIT, HANDOFF_RESULT_BYTE_LIMIT, modelRecordSchema,
+  resultReceiptSchema, reviewResultFileSchema, runManifestFileSchema, serializeHandoffFile, validateHandoffRecords,
+  writePrHandoff, type ExpectedPublication, type PrHandoffInput,
 } from "./handoff"
 
 const sha = "a".repeat(40)
@@ -352,4 +360,221 @@ test("a failed outcome never invents a merge base its capture does not hold", ()
   expect(codes(validateHandoffRecords(uncaptured, parsedManifest({ captured: null })))).toContain("artifact-invalid")
   const divergentCapture = parsedResult({ kind: "failed", failure, snapshot })
   expect(codes(validateHandoffRecords(divergentCapture, parsedManifest({ captured: { ...rawManifest.captured, mergeBaseSha: "b".repeat(40) } })))).toContain("artifact-invalid")
+})
+
+const sourceReference = { side: "head", path: "src/A.java", startLine: 1, endLine: 1, excerpt: "class A {}" }
+
+async function validHandoffInput(overrides: Partial<PrHandoffInput> = {}): Promise<PrHandoffInput> {
+  const programHash = await hashProductSources()
+  const promptHashes = await hashPromptTemplates()
+  const execution = actionsExecutionSchema.parse(rawActionsExecution)
+  const parsedIdentity = identitySchema.parse(identity)
+  const candidate = {
+    id: "C-1",
+    changeLocation: sourceReference,
+    trigger: "A call receives an incompatible result",
+    consequence: "The caller can fail",
+    rootCause: "The return value changed",
+    citations: [sourceReference],
+  }
+  const issue = {
+    candidate,
+    verification: { candidateId: "C-1", decision: "keep", reason: "The source confirms the behavior", evidence: [sourceReference] },
+  }
+  const outcome = prOutcomeSchema.parse({
+    kind: "reviewed",
+    result: {
+      ...reviewedResult({ issues: [issue] }),
+      versions: { program: programHash, sdk: "2.2.7", config: hex64("f"), ...promptHashes },
+    },
+  })
+  const fixedSha = gitShaSchema.parse(sha)
+  const sourceDigest = digestSchema.parse(hex64("e"))
+  const defaults: PrHandoffInput = {
+    identity: parsedIdentity,
+    execution,
+    captured: { baseSha: fixedSha, headSha: fixedSha, mergeBaseSha: fixedSha, observedAt: instant },
+    outcome,
+    backup: backupReceiptSchema.parse({ kind: "absent" }),
+    backupBody: null,
+    configSource: { kind: "base-blob", path: "review.config.json", sha: fixedSha, digest: sourceDigest },
+    model: { providerId: "openai", modelId: "gpt-test" },
+    artifactName: `ai-code-review-handoff-${runId}-1000000`,
+    replayArtifactName: `ai-code-review-replay-${runId}-1000000`,
+    completedAt: instant,
+    replayDirectory: null,
+    productCommit: fixedSha,
+  }
+  return { ...defaults, ...overrides }
+}
+
+function expectedPublication(input: PrHandoffInput, overrides: Partial<ExpectedPublication> = {}): ExpectedPublication {
+  if (input.identity === null || input.execution.kind !== "actions") throw new Error("test fixture requires an Actions handoff")
+  return {
+    identity: input.identity,
+    execution: input.execution,
+    reviewJobResult: "success",
+    productCommit: input.productCommit,
+    programHash: input.outcome.kind === "reviewed" ? digestSchema.parse(input.outcome.result.versions.program) : digestSchema.parse(hex64("b")),
+    ...overrides,
+  }
+}
+
+function admissionReader(input: PrHandoffInput, overrides: Partial<GitHubReader> = {}): GitHubReader {
+  const fixedIdentity = input.identity
+  const fixedExecution = input.execution
+  const fixedCapture = input.captured
+  if (fixedIdentity === null || fixedExecution.kind !== "actions" || fixedCapture === null || fixedCapture.mergeBaseSha === null) {
+    throw new Error("test fixture requires a captured Actions handoff")
+  }
+  const fixedMergeBase = fixedCapture.mergeBaseSha
+  return {
+    async capturePullRequest() { throw new Error("capture is not part of handoff admission") },
+    async readWorkflow() {
+      return {
+        repositoryId: fixedIdentity.repositoryId,
+        runId: fixedExecution.workflowRunId,
+        currentAttempt: fixedExecution.attempt,
+        createdAt: fixedExecution.triggeredAt,
+        attemptStartedAt: fixedExecution.startedAt,
+        status: "in_progress",
+        event: "pull_request",
+      }
+    },
+    async prepareFixedRepository() { throw new Error("fixed repository preparation is not part of handoff admission") },
+    async readProductComment() { throw new Error("comments are not part of handoff admission") },
+    async readArtifactReceipt() {
+      return {
+        id: "123",
+        name: `ai-code-review-handoff-${fixedExecution.workflowRunId}-${fixedExecution.attempt}`,
+        workflowRunId: fixedExecution.workflowRunId,
+        bytes: 1,
+        expired: false,
+        digest: null,
+      }
+    },
+    async readFixedSnapshot() {
+      return { mergeBaseSha: fixedMergeBase, changedHeadPaths: [sourceReference.path] }
+    },
+    async readFixedLines() { return sourceReference.excerpt },
+    ...overrides,
+  }
+}
+
+async function committedPackage(input: PrHandoffInput): Promise<{ root: string; directory: string }> {
+  const root = await mkdtemp(join(tmpdir(), "handoff-admission-"))
+  const outcome = await writePrHandoff({ ...input, out: root })
+  if (outcome.handoffDirectory === null) throw new Error("the test handoff package was not committed")
+  return { root, directory: outcome.handoffDirectory }
+}
+
+test("writePrHandoff commits exactly two files and admitHandoff returns only domain values", async () => {
+  const input = await validHandoffInput()
+  const packageRoot = await committedPackage(input)
+  try {
+    expect((await readdir(packageRoot.directory)).sort()).toEqual(["review-result.json", "run-manifest.json"])
+    const admission = await admitHandoff(packageRoot.directory, expectedPublication(input), admissionReader(input), createBudget(systemClock, 10_000))
+    expect(admission.kind).toBe("valid")
+    if (admission.kind !== "valid") throw new Error("the valid package was rejected")
+    expect(admission.run).toMatchObject({
+      identity,
+      execution: rawActionsExecution,
+      captured: { baseSha: sha, headSha: sha, mergeBaseSha: sha },
+      outcome: { kind: "reviewed" },
+    })
+    expect("schemaVersion" in admission.run).toBe(false)
+  } finally {
+    await rm(packageRoot.root, { recursive: true, force: true })
+  }
+})
+
+test("a corrupted result digest rejects before fixed source reads", async () => {
+  const input = await validHandoffInput()
+  const packageRoot = await committedPackage(input)
+  let fixedReads = 0
+  const original = admissionReader(input)
+  const github: GitHubReader = { ...original, async readFixedSnapshot(args) { fixedReads += 1; return original.readFixedSnapshot(args) } }
+  try {
+    await writeFile(join(packageRoot.directory, "review-result.json"), "{}\n")
+    const admission = await admitHandoff(packageRoot.directory, expectedPublication(input), github, createBudget(systemClock, 10_000))
+    expect(admission.kind).toBe("rejected")
+    expect(fixedReads).toBe(0)
+  } finally {
+    await rm(packageRoot.root, { recursive: true, force: true })
+  }
+})
+
+test("a package with the wrong identity is rejected after its digest is recomputed", async () => {
+  const wrongIdentity: PullRequestIdentity = identitySchema.parse({ ...identity, pr: 18 })
+  const input = await validHandoffInput({ identity: wrongIdentity })
+  const packageRoot = await committedPackage(input)
+  try {
+    const expected = expectedPublication(input, { identity: identitySchema.parse(identity) })
+    const admission = await admitHandoff(packageRoot.directory, expected, admissionReader(input), createBudget(systemClock, 10_000))
+    expect(admission.kind).toBe("rejected")
+  } finally {
+    await rm(packageRoot.root, { recursive: true, force: true })
+  }
+})
+
+test("extra entries and symlinks reject the handoff directory", async () => {
+  const input = await validHandoffInput()
+  const extraPackage = await committedPackage(input)
+  try {
+    await writeFile(join(extraPackage.directory, "extra.json"), "{}\n")
+    expect((await admitHandoff(extraPackage.directory, expectedPublication(input), admissionReader(input), createBudget(systemClock, 10_000))).kind).toBe("rejected")
+  } finally {
+    await rm(extraPackage.root, { recursive: true, force: true })
+  }
+
+  const linkedPackage = await committedPackage(input)
+  try {
+    const target = join(linkedPackage.root, "result-copy.json")
+    await writeFile(target, await readFile(join(linkedPackage.directory, "review-result.json")))
+    await rm(join(linkedPackage.directory, "review-result.json"))
+    await symlink(target, join(linkedPackage.directory, "review-result.json"))
+    expect((await admitHandoff(linkedPackage.directory, expectedPublication(input), admissionReader(input), createBudget(systemClock, 10_000))).kind).toBe("rejected")
+  } finally {
+    await rm(linkedPackage.root, { recursive: true, force: true })
+  }
+})
+
+test("oversized files and multiple exact-name artifact receipts reject", async () => {
+  const input = await validHandoffInput()
+  const oversized = await committedPackage(input)
+  try {
+    await writeFile(join(oversized.directory, "review-result.json"), Buffer.alloc(HANDOFF_RESULT_BYTE_LIMIT + 1, 0x20))
+    expect((await admitHandoff(oversized.directory, expectedPublication(input), admissionReader(input), createBudget(systemClock, 10_000))).kind).toBe("rejected")
+  } finally {
+    await rm(oversized.root, { recursive: true, force: true })
+  }
+
+  const repeated = await committedPackage(input)
+  try {
+    const github = admissionReader(input)
+    const multiple: GitHubReader = {
+      ...github,
+      async readArtifactReceipt() { throw new GitHubError("multiple exact-name artifacts exist", "artifact-invalid") },
+    }
+    expect((await admitHandoff(repeated.directory, expectedPublication(input), multiple, createBudget(systemClock, 10_000))).kind).toBe("rejected")
+  } finally {
+    await rm(repeated.root, { recursive: true, force: true })
+  }
+})
+
+test("an artifact receipt associated with another run rejects", async () => {
+  const input = await validHandoffInput()
+  const packageRoot = await committedPackage(input)
+  try {
+    const github = admissionReader(input)
+    const otherRun: GitHubReader = {
+      ...github,
+      async readArtifactReceipt() {
+        return { id: "124", name: `ai-code-review-handoff-${runId}-1000000`, workflowRunId: runIdSchema.parse("8"), bytes: 1, expired: false, digest: null }
+      },
+    }
+    expect((await admitHandoff(packageRoot.directory, expectedPublication(input), otherRun, createBudget(systemClock, 10_000))).kind).toBe("rejected")
+  } finally {
+    await rm(packageRoot.root, { recursive: true, force: true })
+  }
 })
