@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
-import { readFile, readdir } from "node:fs/promises"
-import { join } from "node:path"
+import { readFile, readdir, realpath } from "node:fs/promises"
+import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { digestSchema, gitShaSchema, type GitSha, type Sha256 } from "./identity"
 
@@ -44,4 +44,14 @@ export async function readProductCommit(): Promise<GitSha> {
   })
   if (result.exitCode !== 0) throw new Error("the fixed product commit is unavailable")
   return gitShaSchema.parse(new TextDecoder("utf-8", { fatal: true }).decode(result.stdout).trim())
+}
+
+export async function readProductIdentity(env: NodeJS.ProcessEnv = process.env): Promise<{ productCommit: GitSha; programHash: Sha256 }> {
+  const commit = gitShaSchema.safeParse(env.REVIEW_PRODUCT_COMMIT)
+  if (!commit.success || env.GITHUB_ACTION_PATH === undefined || !isAbsolute(env.GITHUB_ACTION_PATH) || env.REVIEW_PRODUCT_DIRECTORY === undefined || !isAbsolute(env.REVIEW_PRODUCT_DIRECTORY)) throw new Error("publication requires a fixed Action commit and installed product directory")
+  const [action, configured, installed] = await Promise.all([
+    realpath(resolve(env.GITHUB_ACTION_PATH)), realpath(resolve(env.REVIEW_PRODUCT_DIRECTORY)), realpath(join(sourceDirectory, "..")),
+  ])
+  if (action !== installed || configured !== installed) throw new Error("the Action context differs from the installed product directory")
+  return { productCommit: commit.data, programHash: await hashProductSources() }
 }

@@ -105,3 +105,15 @@ bun run src/cli.ts review --repository PulseInjector/java-review --pr 17 --confi
 `--config` defaults to `review.config.json` in the captured base commit. GitHub reads require `GITHUB_TOKEN`. Analysis also uses the four `REVIEW_MODEL_*` settings described above.
 
 The new output directory contains `handoff/` with exactly `review-result.json` and `run-manifest.json`. It also contains `replay/` and an allowlisted `replay-export/`. The replay export is capped at 64 MiB. If the cap omits files, `replay/artifact-omissions.json` records the omitted bytes and the JSON summary sets `replayIncomplete` to `true`.
+
+The publish form consumes the handoff from the same active Actions run and attempt:
+
+```sh
+bun run src/cli.ts publish --repository PulseInjector/java-review --pr 17 --package /tmp/review-handoff --review-job-result failure
+```
+
+`--review-job-result` accepts `success`, `failure`, `cancelled`, or `skipped`. Publication requires the fixed Action commit and installed product directory. The package cannot supply product identity. A local PR review can produce a handoff but cannot publish it.
+
+The publisher validates the package, selects the lowest-ID owned bot comment, and checks the current PR before each report write. A lost create response triggers complete comment scans without another create in that invocation. A changed PR after a confirmed write gets a stale annotation that retains the covered commits. A failed freshness check gets an unconfirmed warning when the comment API remains available.
+
+The command prints one JSON summary with the publication result, comment ID, evidence directory, and exit code. `publish-result.json` records the checks, intended body digests, write intents, and failures. Actions runs place it in `publish-evidence` under the attempt's runner temporary directory. Missing artifacts, rejected packages, failed reviews, and failed publication exit `1`. Stale results and already published results exit `0`. Failure and skip notes retain the last usable report in a separate section.

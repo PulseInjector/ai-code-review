@@ -1,14 +1,13 @@
 import type { ReviewInput } from "./context"
 import { relativePathSchema } from "./contracts"
 import { createBudget, systemClock, type ExecutionBudget } from "./budget"
-import { createGitHubReader, readExecutionContext } from "./github"
+import { createGitHubReader, createGitHubPublisher, readExecutionContext } from "./github"
 import { modelRecordSchema } from "./handoff"
 import { canonicalPrInputSchema, repositoryNameSchema } from "./identity"
 import { jobResultSchema, type JobResult } from "./pr-contracts"
-import { runPrReview, type PrReviewDependencies, type ReviewCommandOutcome } from "./pr-review"
-import { runReview } from "./review"
-import { loadModelConfiguration } from "./runtime/worker-process"
-import { readProductCommit } from "./product-identity"
+import type { PrReviewDependencies, ReviewCommandOutcome } from "./pr-review"
+import type { PublishDependencies } from "./publish"
+import { readProductCommit, readProductIdentity } from "./product-identity"
 
 export type Command =
   | { kind: "review-local"; input: ReviewInput }
@@ -135,9 +134,11 @@ export type CommandDependencies = {
   stdout?: (line: string) => void
   stderr?: (line: string) => void
   prDependencies?: (command: PrCommand, budget: ExecutionBudget) => Promise<PrReviewDependencies>
+  publishDependencies?: (command: Extract<Command, { kind: "publish" }>, budget: ExecutionBudget) => Promise<PublishDependencies>
 }
 
 async function productionPrDependencies(command: PrCommand, budget: ExecutionBudget, env: NodeJS.ProcessEnv, stderr: (line: string) => void): Promise<PrReviewDependencies> {
+  const { loadModelConfiguration } = await import("./runtime/worker-process")
   const executionContext = await readExecutionContext(env, budget, {}, { pr: command.pr })
   return {
     github: createGitHubReader(env),
@@ -152,6 +153,14 @@ async function productionPrDependencies(command: PrCommand, budget: ExecutionBud
   }
 }
 
+async function productionPublishDependencies(command: Extract<Command, { kind: "publish" }>, budget: ExecutionBudget, env: NodeJS.ProcessEnv, stderr: (line: string) => void): Promise<PublishDependencies> {
+  const context = await readExecutionContext(env, budget, {}, { pr: command.pr })
+  if (context.execution.kind !== "actions") throw new Error("an active Actions context is required for publication")
+  if (context.execution.runUrl !== `https://github.com/${command.repository}/actions/runs/${context.execution.workflowRunId}`) throw new Error("the command repository differs from the Actions repository")
+  return { github: createGitHubPublisher(env), execution: context.execution, progress: (event) => stderr(JSON.stringify(event)),
+    ...await readProductIdentity(env), budget }
+}
+
 export async function dispatchCommand(argv: readonly string[], deps: CommandDependencies = {}): Promise<0 | 1> {
   const env = deps.env ?? process.env
   const stdout = deps.stdout ?? ((line: string) => console.log(line))
@@ -164,6 +173,7 @@ export async function dispatchCommand(argv: readonly string[], deps: CommandDepe
     const command = parseCommand(argv)
     switch (command.kind) {
       case "review-local": {
+        const { runReview } = await import("./review")
         const run = await runReview(command.input)
         stdout(JSON.stringify({ runDirectory: run.runDirectory, result: run.artifacts.result }))
         return run.artifacts.result.status === "failed" ? 1 : 0
@@ -173,12 +183,21 @@ export async function dispatchCommand(argv: readonly string[], deps: CommandDepe
         const prDeps = await (deps.prDependencies === undefined
           ? productionPrDependencies(command, budget, env, stderr)
           : deps.prDependencies(command, budget))
+        const { runPrReview } = await import("./pr-review")
         const outcome = await runPrReview(command, prDeps)
         stdout(reviewPrSummaryLine(outcome))
         return outcome.exitCode
       }
-      case "publish":
-        throw new Error("the publish command is outside this checkpoint")
+      case "publish": {
+        const budget = createBudget(systemClock, 120_000)
+        const publishDeps = await (deps.publishDependencies === undefined
+          ? productionPublishDependencies(command, budget, env, stderr)
+          : deps.publishDependencies(command, budget))
+        const { publishReview } = await import("./publish")
+        const outcome = await publishReview(command, publishDeps)
+        stdout(JSON.stringify(outcome))
+        return outcome.exitCode
+      }
     }
   } catch (error) {
     stderr(sanitizeCliError(error, env))

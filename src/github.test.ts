@@ -5,11 +5,12 @@ import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { BudgetExhaustedError, createBudget, type Clock, type ExecutionBudget } from "./budget"
+import { commentStateSchema, parseStateBlock, renderCommentBody, runUrl } from "./comment"
 import { productReviewConfigPath, reviewLimitsSchema } from "./context"
 import { gitShaSchema } from "./identity"
 import { actionsExecutionSchema, identitySchema, type ActionsExecution, type Failure, type PullRequestIdentity } from "./pr-contracts"
 import {
-  canonicalRepositoryUrl, createGitHubReader, dispatchEventSchema, GitHubError, pullRequestEventSchema,
+  canonicalRepositoryUrl, createGitHubReader, createGitHubPublisher, dispatchEventSchema, GitHubError, pullRequestEventSchema,
   readExecutionContext, type FetchLike, type GitObservation, type GitHubReader, type PullRequestCapture,
 } from "./github"
 
@@ -492,8 +493,8 @@ test("product comments scan every page before absence and enforce the bot author
     [pageUrl(2)]: () => jsonResponse([humanComment(101, "late note"), botComment(500, `${marker()}\nPrevious report.`)]),
   })
   const observation = await reader({ fetchImpl: found.fetchImpl }).readProductComment({ identity, budget: budget() })
-  expect(observation.kind).toBe("owned")
-  if (observation.kind === "owned") {
+  expect(observation.kind).toBe("invalid")
+  if (observation.kind === "invalid") {
     expect(String(observation.canonical.id)).toBe("500")
     expect(observation.canonical.body).toBe(`${marker()}\nPrevious report.`)
     expect(observation.duplicateIds).toEqual([])
@@ -506,7 +507,7 @@ test("product comments scan every page before absence and enforce the bot author
     [linkedUrl]: () => jsonResponse([botComment(300, marker())]),
   })
   const linkedObservation = await reader({ fetchImpl: linked.fetchImpl }).readProductComment({ identity, budget: budget() })
-  expect(linkedObservation.kind).toBe("owned")
+  expect(linkedObservation.kind).toBe("invalid")
   expect(linked.requests()).toBe(2)
 
   const duplicates = listFetch({
@@ -514,8 +515,8 @@ test("product comments scan every page before absence and enforce the bot author
     [pageUrl(2)]: () => jsonResponse([botComment(300, marker()), botComment(400, marker())]),
   })
   const duplicateObservation = await reader({ fetchImpl: duplicates.fetchImpl }).readProductComment({ identity, budget: budget() })
-  expect(duplicateObservation.kind).toBe("owned")
-  if (duplicateObservation.kind === "owned") {
+  expect(duplicateObservation.kind).toBe("invalid")
+  if (duplicateObservation.kind === "invalid") {
     expect(String(duplicateObservation.canonical.id)).toBe("300")
     expect(duplicateObservation.duplicateIds).toEqual(["400", "500"])
   }
@@ -554,8 +555,8 @@ test("comment ownership requires the complete first marker line and reports fore
   const trailing = async (body: string, expectOwned: boolean, expectIds: string[]): Promise<void> => {
     const fetchImpl: FetchLike = async () => jsonResponse([botComment(7, body)])
     const observation = await reader({ fetchImpl }).readProductComment({ identity, budget: budget() })
-    expect(observation.kind).toBe(expectOwned ? "owned" : "absent")
-    if (observation.kind === "owned") {
+    expect(observation.kind).toBe(expectOwned ? "invalid" : "absent")
+    if (observation.kind === "invalid") {
       expect(observation.canonical.body).toBe(body)
       expect(observation.duplicateIds).toEqual([])
     } else if (observation.kind === "absent") {
@@ -1039,4 +1040,113 @@ test("fixed citation reads fetch once and charge repeated references only once",
     expect(invocations.filter(({ args }) => args.includes("fetch"))).toHaveLength(1)
     expect(invocations.filter(({ args }) => args.includes("cat-file") && args.includes("blob"))).toHaveLength(2)
   } finally { await fixture.dispose() }
+})
+
+function publishedFailureBody(): string {
+  return renderCommentBody(commentStateSchema.parse({ schemaVersion: 1, identity, lastReport: null,
+    lastPublishedRun: { status: "failed", execution: { ...actionsExecution, runUrl: runUrl(identity, actionsExecution) },
+      freshness: { kind: "not-reviewed" }, snapshot: null, resultDigest: null,
+      failure: { code: "artifact-missing", stage: "publish", message: "No validated review artifact exists." } },
+    duplicateCommentIds: [], additionalDuplicateCount: 0 }))
+}
+
+test("paginated discovery parses the lowest valid canonical and ignores damaged duplicate state", async () => {
+  const body = publishedFailureBody()
+  const api = listFetch({
+    [commentsPageUrl(1)]: () => jsonResponse([...Array.from({ length: 99 }, (_, index) => humanComment(index + 1, "discussion")), botComment(800, body)]),
+    [commentsPageUrl(2)]: () => jsonResponse([botComment(700, body), botComment(900, `${marker()}\nbroken`), humanComment(1000, body)]),
+  })
+  const observed = await createGitHubPublisher({ GITHUB_TOKEN: TOKEN }, { fetch: api.fetchImpl }).readProductComment({ identity, budget: budget(), stage: "publish" })
+  expect(observed.kind).toBe("valid")
+  if (observed.kind !== "valid") return
+  expect(String(observed.canonical.id)).toBe("700")
+  expect(observed.state).toEqual(parseStateBlock(body))
+  expect(observed.duplicateIds).toEqual(["800", "900"])
+  expect(observed.humanMarkerIds).toEqual(["1000"])
+  expect(api.requests()).toBe(2)
+})
+
+test.each([null, "501"])("comment mutation uses the issue comments endpoint with target %s", async (existingId) => {
+  const body = publishedFailureBody()
+  const calls: string[] = []
+  const fetchImpl: FetchLike = async (input, init) => {
+    calls.push(String(input))
+    expect(init?.method).toBe(existingId === null ? "POST" : "PATCH")
+    expect(init?.redirect).toBe("manual")
+    const headers = new Headers(init?.headers)
+    expect(headers.get("authorization")).toBe(`Bearer ${TOKEN}`)
+    expect(headers.get("accept")).toBe("application/vnd.github+json")
+    expect(headers.get("x-github-api-version")).toBe("2022-11-28")
+    expect(JSON.parse(String(init?.body))).toEqual({ body })
+    return jsonResponse({ ...botComment(501, body), issue_url: `${REPO_URL}/issues/17` })
+  }
+  const writer = createGitHubPublisher({ GITHUB_TOKEN: TOKEN }, { fetch: fetchImpl })
+  const result = await writer.writeComment({ identity, existingId, body, budget: budget() })
+  expect(result.kind).toBe("confirmed")
+  expect(calls).toEqual([existingId === null ? COMMENTS_URL : `${REPO_URL}/issues/comments/501`])
+  expect(calls.some((url) => url.includes("/reviews"))).toBe(false)
+})
+
+test.each(["disconnect", "transient", "secondary-rate-limit", "redirect", "malformed", "wrong-schema", "oversized"])("uncertain comment %s responses never retry in the adapter", async (fault) => {
+  let calls = 0
+  const fetchImpl: FetchLike = async () => {
+    calls += 1
+    if (fault === "disconnect") throw new Error("ECONNRESET token-should-never-leak")
+    if (fault === "transient") return statusResponse(503)
+    if (fault === "secondary-rate-limit") return statusResponse(403, { "retry-after": "1" })
+    if (fault === "redirect") return statusResponse(302, { location: "https://evil.invalid/" })
+    if (fault === "malformed") return new Response("{", { status: 201 })
+    if (fault === "oversized") return new Response("x".repeat(2 * 1024 * 1024 + 1), { status: 201 })
+    return jsonResponse({ id: 1 })
+  }
+  const result = await createGitHubPublisher({ GITHUB_TOKEN: TOKEN }, { fetch: fetchImpl }).writeComment({ identity, existingId: null, body: publishedFailureBody(), budget: budget() })
+  expect(result).toMatchObject({ kind: "unknown", failure: { code: "comment-write-unknown" } })
+  expect(JSON.stringify(result)).not.toContain("token-should-never-leak")
+  expect(calls).toBe(1)
+})
+
+test.each([401, 403, 404, 422])("permanent comment status %s fails directly without retry", async (status) => {
+  let calls = 0
+  const writer = createGitHubPublisher({ GITHUB_TOKEN: TOKEN }, { fetch: async () => { calls += 1; return statusResponse(status) } })
+  await expect(writer.writeComment({ identity, existingId: "501", body: publishedFailureBody(), budget: budget() })).rejects.toMatchObject({ status })
+  expect(calls).toBe(1)
+})
+
+test.each(["author ID", "author login", "author type", "issue", "body", "target ID"])("a confirmed comment with wrong %s rejects", async (field) => {
+  const body = publishedFailureBody()
+  const user = { ...botUser }
+  if (field === "author ID") user.id = 1
+  if (field === "author login") user.login = "human"
+  if (field === "author type") user.type = "User"
+  const fetchImpl: FetchLike = async () => jsonResponse({ ...botComment(field === "target ID" ? 502 : 501, field === "body" ? "changed" : body), user,
+    issue_url: `${REPO_URL}/issues/${field === "issue" ? 18 : 17}` })
+  await expect(createGitHubPublisher({ GITHUB_TOKEN: TOKEN }, { fetch: fetchImpl }).writeComment({ identity, existingId: "501", body, budget: budget() }))
+    .rejects.toMatchObject({ code: "identity-mismatch" })
+})
+
+test("writes refuse oversized bodies and expired budgets before touching transport", async () => {
+  let calls = 0
+  const writer = createGitHubPublisher({ GITHUB_TOKEN: TOKEN }, { fetch: async () => { calls += 1; throw new Error("unexpected") } })
+  await expect(writer.writeComment({ identity, existingId: null, body: "x".repeat(60_001), budget: budget() })).rejects.toMatchObject({ code: "comment-write" })
+  const clock = manualClock()
+  const expired = createBudget(clock, 120_000)
+  clock.advance(120_000)
+  await expect(writer.writeComment({ identity, existingId: null, body: publishedFailureBody(), budget: expired })).rejects.toBeInstanceOf(BudgetExhaustedError)
+  expect(calls).toBe(0)
+})
+
+test("a pending mutation stops at its remaining publish budget and reports uncertainty", async () => {
+  let calls = 0
+  let aborted = false
+  const fetchImpl: FetchLike = async (_input, init) => {
+    calls += 1
+    init?.signal?.addEventListener("abort", () => { aborted = true }, { once: true })
+    return new Promise<Response>(() => {})
+  }
+  const body = publishedFailureBody()
+  const realBudget = createBudget({ monotonicMs: () => performance.now(), wallTime: () => new Date().toISOString(), sleep: async () => {} }, 25)
+  const result = await createGitHubPublisher({ GITHUB_TOKEN: TOKEN }, { fetch: fetchImpl }).writeComment({ identity, existingId: null, body, budget: realBudget })
+  expect(result.kind).toBe("unknown")
+  expect(aborted).toBe(true)
+  expect(calls).toBe(1)
 })

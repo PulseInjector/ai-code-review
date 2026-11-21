@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { z } from "zod"
 import { relativePathSchema, splitLines } from "./contracts"
+import { parseStateBlock, PRODUCT_BOT_POLICY, scanProductComments, type CommentState } from "./comment"
 import { productReviewConfigPath, reviewLimitsSchema, type ReviewLimits } from "./context"
 import {
   attemptSchema, canonicalPrInputSchema, commentIdSchema, gitShaSchema, instantSchema, prNumberSchema,
@@ -27,9 +28,9 @@ const COMMENT_PAGE_SIZE = 100
 const PER_REQUEST_TIMEOUT_MS = 10_000
 const RETRY_DELAYS_MS = [1_000, 2_000] as const
 const RETRIABLE_STATUSES = new Set([429, 500, 502, 503, 504])
-const BOT_LOGIN = "github-actions[bot]"
-const BOT_USER_ID = "41898282"
-const BOT_TYPE = "Bot"
+const BOT_LOGIN = PRODUCT_BOT_POLICY.login
+const BOT_USER_ID = PRODUCT_BOT_POLICY.id
+const BOT_TYPE = PRODUCT_BOT_POLICY.type
 const ASKPASS_TOKEN_VARIABLE = "REVIEW_GIT_ASKPASS_TOKEN"
 const FIXED_CONFIG_BYTE_LIMIT = 16 * 1024
 const FIXED_LINES_FILE_BYTE_LIMIT = 8 * 1024 * 1024
@@ -164,13 +165,10 @@ export type ProductComment = {
   createdAt: string
   updatedAt: string
 }
-// Checkpoint 5 splits "owned" into valid and invalid through the parsed comment state from
-// src/comment.ts. The review-time backup treats both identically, so this checkpoint reports one
-// owned observation and defers state parsing to the publisher. Non-bot copies of the exact marker
-// line ride along by ID so the job summary can warn about them without ever modifying them.
 export type CommentObservation =
   | { kind: "absent"; duplicateIds: []; humanMarkerIds: string[] }
-  | { kind: "owned"; canonical: ProductComment; duplicateIds: string[]; humanMarkerIds: string[] }
+  | { kind: "valid"; canonical: ProductComment; state: CommentState; duplicateIds: string[]; humanMarkerIds: string[] }
+  | { kind: "invalid"; canonical: ProductComment; reason: string; duplicateIds: string[]; humanMarkerIds: string[] }
 export type ArtifactReceipt = { id: string; name: string; workflowRunId: string; bytes: number; expired: boolean; digest: Sha256 | null }
 export type SourceLineRequest = { sha: GitSha; path: string; startLine: number; endLine: number }
 export type FixedSource = { side: "merge-base" | "head"; path: string; text: string }
@@ -184,6 +182,12 @@ export interface GitHubReader {
   readArtifactReceipt(input: { identity: PullRequestIdentity; execution: ActionsExecution; budget: ExecutionBudget; stage?: Stage }): Promise<ArtifactReceipt | null>
   readFixedSnapshot(input: { identity: PullRequestIdentity; baseSha: GitSha; headSha: GitSha; sources?: Pick<FixedSource, "side" | "path">[]; budget: ExecutionBudget; stage?: Stage }): Promise<FixedSnapshotEvidence>
   readFixedLines(input: SourceLineRequest & { repository: string; budget: ExecutionBudget; stage?: Stage }): Promise<string>
+}
+
+export interface GitHubPublisher extends GitHubReader {
+  writeComment(input: { identity: PullRequestIdentity; existingId: string | null; body: string; budget: ExecutionBudget }): Promise<
+    { kind: "confirmed"; comment: ProductComment } | { kind: "unknown"; failure: Failure }
+  >
 }
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>
@@ -660,10 +664,6 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
     },
 
     async readProductComment({ identity, budget, stage = "prepare-init" }): Promise<CommentObservation> {
-      // A human may copy the marker text, but author login, numeric ID, and type must all match
-      // the product bot policy before a comment is owned, and the complete first line must equal
-      // the marker exactly. The whole list is scanned before absence is chosen.
-      const marker = `<!-- ai-code-review:v1 repo=${identity.repositoryId} pr=${identity.pr} -->`
       const commentsPath = `${apiRepositoryPath(identity.repository)}/issues/${identity.pr}/comments`
       let requests = 0
       let decodedBytes = 0
@@ -671,8 +671,7 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
       let url: string | null = `${commentsPath}?per_page=${COMMENT_PAGE_SIZE}&page=1`
       const seenPages = new Set<string>()
       const seenCommentIds = new Set<string>()
-      const owned: ProductComment[] = []
-      const humanMarkerIds: string[] = []
+      const candidates: (ProductComment & { authorType: string })[] = []
       while (url !== null) {
         if (requests >= COMMENT_LIST_PAGE_LIMIT) throw new GitHubError("the comment listing exceeded the page limit", "comment-list-limit")
         requests += 1
@@ -689,19 +688,9 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
             throw new GitHubError("GitHub repeated a comment during pagination", "comment-list-limit")
           }
           seenCommentIds.add(comment.id)
-          if (comment.body.split("\n", 1)[0] !== marker) continue
-          const isProductBot = comment.user.login === BOT_LOGIN && comment.user.id === BOT_USER_ID && comment.user.type === BOT_TYPE
-          if (!isProductBot) {
-            humanMarkerIds.push(comment.id)
-            continue
-          }
-          owned.push({
-            id: comment.id,
-            authorId: comment.user.id,
-            authorLogin: comment.user.login,
-            body: comment.body,
-            createdAt: comment.created_at,
-            updatedAt: comment.updated_at,
+          candidates.push({
+            id: comment.id, authorId: comment.user.id, authorLogin: comment.user.login, authorType: comment.user.type,
+            body: comment.body, createdAt: comment.created_at, updatedAt: comment.updated_at,
           })
         }
         const linked = sameOriginNextLink(response.headers, commentsPath)
@@ -713,12 +702,15 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
           url = `${commentsPath}?per_page=${COMMENT_PAGE_SIZE}&page=${page}`
         } else url = null
       }
-      if (owned.length === 0) return { kind: "absent", duplicateIds: [], humanMarkerIds }
-      // The lowest numeric comment ID is canonical; every other owned comment is a recorded
-      // duplicate and is never updated.
-      owned.sort((left, right) => Number(left.id) - Number(right.id))
-      const [canonical, ...duplicates] = owned
-      return { kind: "owned", canonical: canonical!, duplicateIds: duplicates.map(({ id }) => id), humanMarkerIds }
+      const scanned = scanProductComments(candidates, identity)
+      if (scanned.canonical === null) return { kind: "absent", duplicateIds: [], humanMarkerIds: scanned.humanMarkerIds }
+      const { authorType: _, ...canonical } = scanned.canonical
+      const duplicateIds = scanned.duplicates.map(({ id }) => id)
+      try {
+        return { kind: "valid", canonical, state: parseStateBlock(canonical.body, identity), duplicateIds, humanMarkerIds: scanned.humanMarkerIds }
+      } catch {
+        return { kind: "invalid", canonical, reason: "the canonical bot comment has invalid state", duplicateIds, humanMarkerIds: scanned.humanMarkerIds }
+      }
     },
 
     async readArtifactReceipt({ identity, execution, budget, stage = "publish" }): Promise<ArtifactReceipt | null> {
@@ -910,5 +902,67 @@ export async function readExecutionContext(
       runUrl: `${WEB_ORIGIN}/${seed.GITHUB_REPOSITORY}/actions/runs/${seed.GITHUB_RUN_ID}`,
     }, "Actions execution identity"),
     attemptStartedAt: observation.attemptStartedAt,
+  }
+}
+
+export function createGitHubPublisher(env: NodeJS.ProcessEnv, deps: GitHubReaderDeps = {}): GitHubPublisher {
+  const reader = createGitHubReader(env, deps)
+  const doFetch = deps.fetch ?? fetch
+  const token = env.GITHUB_TOKEN!.trim()
+  return {
+    ...reader,
+    async writeComment({ identity, existingId, body, budget }) {
+      budget.assertRemaining("publish")
+      if (Buffer.byteLength(body) > 60_000) throw new GitHubError("the intended comment exceeds its byte cap", "comment-write")
+      if (existingId !== null) commentIdSchema.parse(existingId)
+      const repositoryPath = apiRepositoryPath(identity.repository)
+      const url = existingId === null ? `${repositoryPath}/issues/${identity.pr}/comments` : `${repositoryPath}/issues/comments/${existingId}`
+      try {
+        const result = await withinDeadline(async (signal) => {
+          const response = await doFetch(url, {
+            method: existingId === null ? "POST" : "PATCH", redirect: "manual", signal,
+            headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": PRODUCT_USER_AGENT },
+            body: JSON.stringify({ body }),
+          })
+          if (response.status !== 200 && response.status !== 201) {
+            await response.body?.cancel().catch(() => undefined)
+            if (response.status === 422) throw new GitHubError("GitHub rejected the comment validation", "comment-write", response.status)
+            if ([401, 403, 404].includes(response.status) && !(response.status === 403 && rateLimitEvidence(response))) throw classifiedError(response)
+            return null
+          }
+          const chunks: Uint8Array[] = []
+          let size = 0
+          const stream = response.body?.getReader()
+          if (stream === undefined) return null
+          const abort = () => { void stream.cancel().catch(() => undefined) }
+          signal.addEventListener("abort", abort, { once: true })
+          try {
+            for (;;) {
+              signal.throwIfAborted()
+              const { done, value } = await stream.read()
+              if (done) break
+              size += value.byteLength
+              if (size > REQUEST_BYTE_CAP) throw new Error("comment response exceeds its byte cap")
+              chunks.push(value)
+            }
+          } finally { signal.removeEventListener("abort", abort); void stream.cancel().catch(() => undefined) }
+          const bytes = Buffer.concat(chunks)
+          let raw: unknown
+          try { raw = JSON.parse(strictDecoder.decode(bytes)) } catch { return null }
+          const parsed = commentResponseSchema.extend({ issue_url: z.url() }).safeParse(raw)
+          if (!parsed.success) return null
+          const comment = parsed.data
+          if (comment.user.login !== BOT_LOGIN || comment.user.id !== BOT_USER_ID || comment.user.type !== BOT_TYPE ||
+            comment.issue_url !== `${repositoryPath}/issues/${identity.pr}` || comment.body !== body || existingId !== null && comment.id !== existingId) {
+            throw new GitHubError("the comment response identity or body differs from the intended write", "identity-mismatch")
+          }
+          return { id: comment.id, authorId: comment.user.id, authorLogin: comment.user.login, body: comment.body, createdAt: comment.created_at, updatedAt: comment.updated_at }
+        }, Date.now() + Math.min(PER_REQUEST_TIMEOUT_MS, budget.stageRemainingMs("publish")))
+        if (result.kind === "completed" && result.value !== null) return { kind: "confirmed", comment: result.value }
+      } catch (error) {
+        if (error instanceof GitHubError) throw error
+      }
+      return { kind: "unknown", failure: { code: "comment-write-unknown", stage: "publish", message: "the comment write could not be confirmed" } }
+    },
   }
 }
