@@ -1,6 +1,6 @@
 import { z } from "zod"
 import {
-  completeResultCoversAllWork, discoveryOutputSchema, deriveKeepPublication, identifierSchema,
+  completeResultCoversAllWork, deriveReviewStatus, discoveryOutputSchema, deriveKeepPublication, identifierSchema,
   relativePathSchema, reviewResultObjectSchema, snapshotSchema, terminalResultPublishesNoIssues,
   textSchema, verificationOutputSchema, type DiscoveryOutput, type PublishedIssue,
 } from "./contracts"
@@ -227,18 +227,6 @@ function issueViolationAgainstVerification(
   return null
 }
 
-// Complete means no omitted work, no unverified or unpublished candidates, no pending tool pages,
-// and no stage error. Cleanup success is the absence of a cleanup failure at this boundary.
-function derivedStatus(result: UsableReviewResult, pendingToolPages: number): "complete" | "partial" {
-  const { coverage } = result
-  const clean = pendingToolPages === 0 &&
-    coverage.omittedPaths.length === 0 &&
-    coverage.unverifiedCandidateIds.length === 0 &&
-    coverage.unpublishedCandidateIds.length === 0 &&
-    result.stageErrors.length === 0
-  return clean ? "complete" : "partial"
-}
-
 // An interrupted verification leaves no accepted keep, so a partial from a discovered checkpoint
 // carries zero current findings and names exactly the discovered candidates unverified.
 function discoveredPartialViolation(result: UsableReviewResult, discovery: DiscoveryOutput): string | null {
@@ -291,6 +279,9 @@ export function reduceTerminalReview(input: {
   if (result === undefined) {
     return reject("input-invalid", "a reviewed outcome requires an assembled review result")
   }
+  if (failure === undefined && result.status === "complete" && deriveReviewStatus(result, pendingToolPages) === "partial") {
+    return reject("input-invalid", "assembled result status complete does not match the derived status partial")
+  }
   const usable = usableReviewResultSchema.safeParse(result)
   if (!usable.success) {
     return reject("input-invalid", "the assembled result does not satisfy the bounded PR review-result contract")
@@ -331,7 +322,7 @@ export function reduceTerminalReview(input: {
       if (violation !== null) return reject("candidate-set-invalid", violation)
       const accountingError = accountingViolation(usable.data, verifiedCheckpointAccounting(checkpoint))
       if (accountingError !== null) return reject("candidate-set-invalid", accountingError)
-      const derived = derivedStatus(usable.data, pendingToolPages)
+      const derived = deriveReviewStatus(usable.data, pendingToolPages)
       if (usable.data.status !== derived) {
         return reject("input-invalid", `assembled result status ${usable.data.status} does not match the derived status ${derived}`)
       }

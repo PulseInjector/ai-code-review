@@ -1,7 +1,7 @@
 import { writeFilesBefore } from "./budget"
 import type { PrReviewResult } from "./pr-contracts"
 import { join } from "node:path"
-import { reviewResultSchema, type Candidate, type ReviewResult, type Verification } from "./contracts"
+import { deriveReviewStatus, reviewResultSchema, type Candidate, type ReviewResult, type Verification } from "./contracts"
 import type { ContextManifest } from "./context"
 import type { DiscoveryVerificationResult } from "./discovery"
 import type { RuntimeResult } from "./runtime/contracts"
@@ -74,6 +74,12 @@ export function createRunArtifacts(options: {
   const { context, discovery, runId, durationMs } = options
   const runtime = discovery?.runtime ?? options.runtime
   const issues = discovery?.issues ?? []
+  const acceptedKeepIds = new Set(discovery?.verifications
+    .filter((verification) => verification.decision === "keep")
+    .map((verification) => verification.candidateId) ?? [])
+  const unverifiedCandidateIds = discovery === undefined
+    ? (options.candidates ?? []).map(({ id }) => id)
+    : discovery.candidates.filter(({ id }) => !acceptedKeepIds.has(id)).map(({ id }) => id)
   const notes = [
     ...(context.status === "partial" ? ["Prepared snapshot has omitted paths."] : []),
     ...context.coverage.omittedPaths.map((path) => `${path}: ${context.files.find((file) => file.path === path && !file.included)?.reason ?? "not included"}.`),
@@ -85,7 +91,8 @@ export function createRunArtifacts(options: {
   const stageErrors = options.error ? [{ stage: options.error.stage, code: "review-failed", message: options.error.message.slice(0, 2_000) }] : []
   if (context.changes.length === 0) notes.push("No changes between the merge base and head; model sessions were skipped.")
   else if (!context.changes.some(({ included }) => included)) notes.push("No changed files could be included; model sessions were skipped.")
-  const status: ReviewResult["status"] = options.error ? "failed" : context.changes.length === 0 ? "skipped" : notes.length ? "partial" : "complete"
+  const status: ReviewResult["status"] = options.error ? "failed" : context.changes.length === 0 ? "skipped"
+    : deriveReviewStatus({ coverage: { omittedPaths: context.coverage.omittedPaths, unverifiedCandidateIds, unpublishedCandidateIds: discovery?.unreportedCandidateIds ?? [], notes }, stageErrors })
   const result = reviewResultSchema.parse({
     runId,
     snapshot: context.snapshot,
@@ -94,7 +101,7 @@ export function createRunArtifacts(options: {
     coverage: {
       includedPaths: context.coverage.includedPaths,
       omittedPaths: context.coverage.omittedPaths,
-      unverifiedCandidateIds: discovery ? discovery.unknownCandidateIds : (options.candidates ?? []).map(({ id }) => id),
+      unverifiedCandidateIds,
       unpublishedCandidateIds: discovery?.unreportedCandidateIds ?? [],
       notes: notes.map((note) => note.slice(0, 2_000)),
     },
@@ -119,6 +126,12 @@ export async function writeRunArtifacts(runDirectory: string, result: ReviewResu
   files: Array<[string, string]>
 }): Promise<boolean> {
   const runtime = options.discovery?.runtime ?? options.runtime
+  const requestEvidence = {
+    requests: runtime?.requests ?? { records: [], capped: false, unavailable: true },
+    submission: runtime?.submission ?? { kind: "not-submitted" },
+    phaseDeadlines: runtime?.phaseDeadlines ?? null,
+    checkpointSequence: runtime?.checkpointSequence ?? 0,
+  }
   const writes: Array<[string, string]> = [
     ...options.files,
     ["report.md", renderMarkdown(result)],
@@ -127,15 +140,10 @@ export async function writeRunArtifacts(runDirectory: string, result: ReviewResu
     ["versions.json", `${JSON.stringify(result.versions, null, 2)}\n`],
     ["candidates.json", `${JSON.stringify(options.discovery?.candidates ?? options.candidates ?? [], null, 2)}\n`],
     ["verifications.json", `${JSON.stringify(options.discovery?.verifications ?? options.verifications ?? [], null, 2)}\n`],
-    ["tool-trace.json", `${JSON.stringify(runtime?.readBudget ?? { records: [], unavailable: true }, null, 2)}\n`],
+    ["tool-trace.json", `${JSON.stringify({ ...(runtime?.readBudget ?? { records: [], unavailable: true }), ...requestEvidence }, null, 2)}\n`],
     // The request ledger is trace evidence: no request that reached the policy hooks is dropped,
     // and the cap that stopped further requests is recorded instead of hidden.
-    ["requests.json", `${JSON.stringify({
-      requests: runtime?.requests ?? { records: [], capped: false, unavailable: true },
-      submission: runtime?.submission ?? { kind: "not-submitted" },
-      phaseDeadlines: runtime?.phaseDeadlines ?? null,
-      checkpointSequence: runtime?.checkpointSequence ?? 0,
-    }, null, 2)}\n`],
+    ["requests.json", `${JSON.stringify(requestEvidence, null, 2)}\n`],
     ["sessions.json", `${JSON.stringify(runtime?.sessions ?? [], null, 2)}\n`],
     ["usage.json", `${JSON.stringify(result.usage, null, 2)}\n`],
     ["cleanup.json", `${JSON.stringify(runtime?.cleanup ?? { hostClosed: false, forced: false, notStarted: true }, null, 2)}\n`],

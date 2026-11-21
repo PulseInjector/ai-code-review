@@ -6,7 +6,7 @@ import { z } from "zod"
 import { relativePathSchema, splitLines } from "./contracts"
 import { productReviewConfigPath, reviewLimitsSchema, type ReviewLimits } from "./context"
 import {
-  attemptSchema, commentIdSchema, gitShaSchema, instantSchema, prNumberSchema,
+  attemptSchema, canonicalPrInputSchema, commentIdSchema, gitShaSchema, instantSchema, prNumberSchema,
   repositoryIdSchema, repositoryNameSchema, runIdSchema, type GitSha, type Sha256,
 } from "./identity"
 import {
@@ -173,6 +173,8 @@ export type CommentObservation =
   | { kind: "owned"; canonical: ProductComment; duplicateIds: string[]; humanMarkerIds: string[] }
 export type ArtifactReceipt = { id: string; name: string; workflowRunId: string; bytes: number; expired: boolean; digest: Sha256 | null }
 export type SourceLineRequest = { sha: GitSha; path: string; startLine: number; endLine: number }
+export type FixedSource = { side: "merge-base" | "head"; path: string; text: string }
+export type FixedSnapshotEvidence = { mergeBaseSha: GitSha; changedHeadPaths: string[]; sources: FixedSource[] }
 
 export interface GitHubReader {
   capturePullRequest(input: { repository: string; pr: number; budget: ExecutionBudget; stage?: Stage }): Promise<PullRequestCapture>
@@ -180,6 +182,7 @@ export interface GitHubReader {
   prepareFixedRepository(input: { captured: PullRequestCapture; configPath: string; budget: ExecutionBudget; stage?: Stage }): Promise<FixedRepository>
   readProductComment(input: { identity: PullRequestIdentity; budget: ExecutionBudget; stage?: Stage }): Promise<CommentObservation>
   readArtifactReceipt(input: { identity: PullRequestIdentity; execution: ActionsExecution; budget: ExecutionBudget; stage?: Stage }): Promise<ArtifactReceipt | null>
+  readFixedSnapshot(input: { identity: PullRequestIdentity; baseSha: GitSha; headSha: GitSha; sources?: Pick<FixedSource, "side" | "path">[]; budget: ExecutionBudget; stage?: Stage }): Promise<FixedSnapshotEvidence>
   readFixedLines(input: SourceLineRequest & { repository: string; budget: ExecutionBudget; stage?: Stage }): Promise<string>
 }
 
@@ -597,6 +600,65 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
       }
     },
 
+    async readFixedSnapshot({ identity, baseSha, headSha, sources = [], budget, stage = "publish" }): Promise<FixedSnapshotEvidence> {
+      const base = parseInput(gitShaSchema, baseSha, "fixed base commit")
+      const head = parseInput(gitShaSchema, headSha, "fixed head commit")
+      const parent = await mkdtemp(join(tmpdir(), "ai-code-review-snapshot-"))
+      try {
+        const directory = join(parent, "repo.git")
+        const env = gitEnvironment(await writeAskPassHelper(parent))
+        gitBytes({ args: ["init", "--bare", "--quiet", directory], env, budget, stage, label: "bare repository init", failureCode: "snapshot-fetch" })
+        await fetchFixedObjects({ directory, env, budget, stage, repository: identity.repository, objects: [base, head] })
+        const mergeBase = gitText({
+          args: ["-C", directory, "merge-base", base, head], env, budget, stage,
+          label: "fixed merge-base computation", failureCode: "snapshot-fetch",
+        })
+        if (mergeBase === "") throw new GitHubError("the fixed base and head share no merge base", "snapshot-fetch")
+        const changed = gitBytes({
+          args: ["-C", directory, "diff", "--name-only", "--diff-filter=ACMRT", "-z", mergeBase, head],
+          env, budget, stage, label: "fixed changed-path listing", failureCode: "snapshot-fetch",
+        })
+        const paths = strictDecoder.decode(changed).split("\0").filter((path) => path !== "")
+        const sourceFiles: FixedSource[] = []
+        const sourceCache = new Map<string, string>()
+        let totalBytes = 0
+        for (const source of sources) {
+          const path = parseInput(relativePathSchema, source.path, "citation source path")
+          const sha = source.side === "head" ? head : parseInput(gitShaSchema, mergeBase, "computed merge base")
+          const key = `${sha}\0${path}`
+          const cached = sourceCache.get(key)
+          if (cached !== undefined) {
+            sourceFiles.push({ ...source, text: cached })
+            continue
+          }
+          const entry = literalTreeEntry({ directory, env, budget, stage, sha, path, label: "citation source", failureCode: "snapshot-fetch" })
+          if (entry === null || entry.type !== "blob" || !["100644", "100755"].includes(entry.mode)) {
+            throw new GitHubError(`${path} is not a regular fixed source file`, "citation-invalid")
+          }
+          const sizeText = gitText({ args: ["-C", directory, "cat-file", "-s", entry.oid], env, budget, stage, label: "citation size", failureCode: "snapshot-fetch" })
+          const size = Number(sizeText)
+          if (!/^[0-9]+$/u.test(sizeText) || size > FIXED_LINES_FILE_BYTE_LIMIT || totalBytes + size > 16 * 1024 * 1024) {
+            throw new GitHubError("citation sources exceed the per-file or aggregate read cap", "citation-invalid")
+          }
+          totalBytes += size
+          const blob = gitBytes({ args: ["-C", directory, "cat-file", "blob", entry.oid], env, budget, stage, label: "citation blob", failureCode: "snapshot-fetch" })
+          if (blob.byteLength !== size) throw new GitHubError("the citation source size changed", "citation-invalid")
+          let text: string
+          try { text = strictDecoder.decode(blob) }
+          catch { throw new GitHubError(`${path} is not valid UTF-8 text`, "citation-invalid") }
+          sourceCache.set(key, text)
+          sourceFiles.push({ ...source, path, text })
+        }
+        return {
+          mergeBaseSha: parseInput(gitShaSchema, mergeBase, "computed merge base"),
+          changedHeadPaths: paths.map((path) => parseInput(relativePathSchema, path, "changed head path")),
+          sources: sourceFiles,
+        }
+      } finally {
+        await rm(parent, { recursive: true, force: true })
+      }
+    },
+
     async readProductComment({ identity, budget, stage = "prepare-init" }): Promise<CommentObservation> {
       // A human may copy the marker text, but author login, numeric ID, and type must all match
       // the product bot policy before a comment is owned, and the complete first line must equal
@@ -660,10 +722,25 @@ export function createGitHubReader(env: NodeJS.ProcessEnv, deps: GitHubReaderDep
     },
 
     async readArtifactReceipt({ identity, execution, budget, stage = "publish" }): Promise<ArtifactReceipt | null> {
-      const runJson = await apiJson({ url: `${apiRepositoryPath(identity.repository)}/actions/runs/${execution.workflowRunId}/artifacts?per_page=100`, budget, stage })
-      const list = parseResponse(artifactListSchema, runJson.value, "artifact list")
       const expectedName = `ai-code-review-handoff-${execution.workflowRunId}-${execution.attempt}`
-      const matches = list.artifacts.filter(({ name }) => name === expectedName)
+      const endpoint = `${apiRepositoryPath(identity.repository)}/actions/runs/${execution.workflowRunId}/artifacts`
+      const matches: z.output<typeof artifactResponseSchema>[] = []
+      const seenIds = new Set<string>()
+      let total = 0
+      for (let page = 1; ; page++) {
+        if (page > 200) throw new GitHubError("the artifact listing exceeded its page cap", "artifact-provenance")
+        const url = `${endpoint}?per_page=100${page === 1 ? "" : `&page=${page}`}`
+        const runJson = await apiJson({ url, budget, stage })
+        const list = parseResponse(artifactListSchema, runJson.value, "artifact list")
+        for (const artifact of list.artifacts) {
+          if (seenIds.has(artifact.id)) throw new GitHubError("the artifact listing repeated an artifact", "artifact-provenance")
+          seenIds.add(artifact.id)
+          if (artifact.name === expectedName) matches.push(artifact)
+        }
+        total += list.artifacts.length
+        if (total >= list.total_count) break
+        if (list.artifacts.length === 0) throw new GitHubError("the artifact listing ended before its declared total", "artifact-provenance")
+      }
       if (matches.length === 0) return null
       if (matches.length > 1) throw new GitHubError("multiple artifacts match the expected handoff name", "artifact-invalid")
       const artifact = matches[0]!
@@ -717,7 +794,6 @@ const ACTIONS_ENVIRONMENT_KEYS = [
   "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH", "GITHUB_SERVER_URL",
 ] as const
 
-const canonicalPrInputSchema = z.string().regex(/^[1-9][0-9]{0,9}$/).transform(Number).pipe(prNumberSchema)
 const decimalAttemptSchema = z.string().regex(/^[1-9][0-9]{0,5}$/).transform(Number).pipe(attemptSchema)
 const actionsEnvSchema = z.strictObject({
   GITHUB_REPOSITORY: repositoryNameSchema,

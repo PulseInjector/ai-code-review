@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto"
-import { lstat, mkdir } from "node:fs/promises"
-import { join, resolve } from "node:path"
+import { lstat, mkdir, realpath } from "node:fs/promises"
+import { basename, dirname, join, resolve, sep } from "node:path"
+import { fileURLToPath } from "node:url"
 import { z } from "zod"
-import { backupReceiptSchema } from "./handoff"
+import { backupReceiptSchema, writePrHandoff, type CapturedSnapshot, type PrHandoffInput } from "./handoff"
 import { GitHubError, credentialFreeGitEnvironment, type FixedRepository, type GitHubReader, type PullRequestCapture } from "./github"
 import { runReview, type ReviewRun } from "./review"
 import { loadModelConfiguration } from "./runtime/worker-process"
@@ -12,10 +13,11 @@ import {
   phaseCheckpointSchema, prReviewResultSchema, recoverableFailureCodes, reduceTerminalReview,
   type Execution, type Failure, type PhaseCheckpoint, type PrOutcome, type PrReviewResult, type PullRequestIdentity,
 } from "./pr-contracts"
-import { deriveKeepPublication, type Candidate, type ReviewResult, type Verification } from "./contracts"
+import { deriveReviewStatus, deriveKeepPublication, type Candidate, type ReviewResult, type Verification } from "./contracts"
 import { gitShaSchema, type GitSha, type Sha256 } from "./identity"
 import type { ExecutionBudget } from "./budget"
 import type { ProgressEvent, ProgressSink } from "./progress"
+import { readProductCommit } from "./product-identity"
 
 const BACKUP_BODY_BYTE_LIMIT = 60_000
 const FIXED_REPOSITORY_DISPOSAL_MS = 1_000
@@ -81,37 +83,22 @@ export type PrReviewDependencies = {
   modelIdentity: () => { providerId: string; modelId: string }
   model: () => ReturnType<typeof loadModelConfiguration>
   budget: ExecutionBudget
+  callerDirectory?: string
+  productCommit?: GitSha
   attemptStartedAt?: string
   runWorker?: DiscoveryWorker
 }
 
 export type PreviousCommentBackup = { receipt: z.infer<typeof backupReceiptSchema>; body: string | null }
 
-export type CapturedSnapshot = { baseSha: GitSha; headSha: GitSha; mergeBaseSha: GitSha | null; observedAt: string }
-
-// The structured values writePrHandoff will need at checkpoint 4. Checkpoint 2 returns them
-// instead of writing handoff files.
-export type PrHandoffInput = {
-  identity: PullRequestIdentity | null
-  execution: Execution
-  captured: CapturedSnapshot | null
-  outcome: PrOutcome
-  backup: z.infer<typeof backupReceiptSchema>
-  backupBody: string | null
-  configSource: FixedRepository["configSource"] | null
-  model: { providerId: string; modelId: string } | null
-  artifactName: string | null
-  replayArtifactName: string | null
-  completedAt: string
-  replayDirectory: string | null
-}
-
 export type ReviewCommandOutcome = {
   outcome: PrOutcome
   runDirectory: string
   handoffDirectory: string | null
+  replayExportDirectory: string | null
+  replayIncomplete: boolean
+  omittedTraceBytes: number
   artifactName: string | null
-  handoff: PrHandoffInput
   exitCode: 0 | 1
 }
 
@@ -270,19 +257,31 @@ function prResultFromRun(run: ReviewRun): PrReviewResult {
     : run.discovery.candidates
       .filter((candidate) => !run.discovery!.verifications.some((verification) => verification.decision === "keep" && verification.candidateId === candidate.id))
       .map((candidate) => candidate.id)
-  const { coverage, truncated } = boundCoverageForPublication({ ...result.coverage, unverifiedCandidateIds })
-  const clean = !truncated && pendingToolPages(run) === 0 && result.stageErrors.length === 0 &&
-    coverage.unverifiedCandidateIds.length === 0 && coverage.unpublishedCandidateIds.length === 0 &&
-    coverage.omittedPaths.length === 0
+  const { coverage } = boundCoverageForPublication({ ...result.coverage, unverifiedCandidateIds })
   return prReviewResultSchema.parse({
     ...result,
-    status: clean ? "complete" : "partial",
+    status: deriveReviewStatus({ ...result, coverage }, pendingToolPages(run)),
     coverage,
   })
 }
 
 export async function runPrReview(command: PrReviewCommand, deps: PrReviewDependencies): Promise<ReviewCommandOutcome> {
-  const out = resolve(command.out)
+  const requestedOut = resolve(command.out)
+  const out = join(await realpath(dirname(requestedOut)), basename(requestedOut))
+  const productDirectory = await realpath(fileURLToPath(new URL("..", import.meta.url)))
+  const callerDirectory = await realpath(deps.callerDirectory ?? process.env.GITHUB_WORKSPACE ?? process.cwd())
+  deps.budget.assertRemaining("prepare-init")
+  const callerRoot = Bun.spawnSync(["git", "-C", callerDirectory, "rev-parse", "--show-toplevel"], {
+    env: credentialFreeGitEnvironment(), stdout: "pipe", stderr: "pipe", timeout: Math.max(1, deps.budget.stageRemainingMs("prepare-init")),
+  })
+  if (callerRoot.exitedDueToTimeout) throw new BudgetExhaustedError("output location validation exceeded the preparation deadline", "prepare-init")
+  const callerCheckout = callerRoot.exitCode === 0 ? await realpath(new TextDecoder().decode(callerRoot.stdout).trim()) : callerDirectory
+  for (const checkout of [productDirectory, callerCheckout]) {
+    if (out === checkout || out.startsWith(`${checkout}${sep}`)) {
+      throw new GitHubError("the output directory must be outside the caller and product checkouts", "input-invalid")
+    }
+  }
+  const productCommit = deps.productCommit ?? await readProductCommit()
   await withinStage(deps.budget, "prepare-init", async (signal) => {
     if (await lstat(out).then(() => true, () => false)) {
       throw new GitHubError("the output directory must be a new directory", "input-invalid")
@@ -323,28 +322,40 @@ export async function runPrReview(command: PrReviewCommand, deps: PrReviewDepend
   let captured: PullRequestCapture | null = null
   let configSource: FixedRepository["configSource"] | null = null
   let backup: PreviousCommentBackup = { receipt: { kind: "absent" }, body: null }
-  const failureOutcome = (failure: Failure, runDirectory: string, replayRan: boolean): ReviewCommandOutcome => {
+  const failureOutcome = async (failure: Failure, runDirectory: string, replayRan: boolean): Promise<ReviewCommandOutcome> => {
     const outcome: PrOutcome = { kind: "failed", failure, snapshot: null }
+    return finalize({
+      identity: captured?.identity ?? null,
+      execution: deps.execution,
+      captured: captured === null ? null : { baseSha: captured.baseSha, headSha: captured.headSha, mergeBaseSha: null, observedAt: captured.observedAt },
+      outcome,
+      backup: backup.receipt,
+      backupBody: backup.body,
+      configSource,
+      model: modelRecord,
+      artifactName,
+      replayArtifactName,
+      completedAt: new Date().toISOString(),
+      replayDirectory: replayRan ? replayDirectory : null,
+    }, runDirectory, 1)
+  }
+
+  async function finalize(input: Omit<PrHandoffInput, "productCommit">, runDirectory: string, requestedExitCode: 0 | 1): Promise<ReviewCommandOutcome> {
+    const written = await writePrHandoff({ ...input, productCommit, out }, { budget: deps.budget })
+    let outcome = written.outcome
+    if (input.identity !== null && written.handoffDirectory === null && outcome.kind === "skipped") {
+      outcome = { kind: "failed", failure: { code: "artifact-write", stage: "handoff", message: "the handoff package could not be committed" }, snapshot: outcome.snapshot }
+    }
+    const exitCode = outcome.kind === "failed" ? 1 : outcome.kind === "skipped" ? 0 : requestedExitCode === 1 ? 1 : exitCodeFor(outcome)
     return {
       outcome,
       runDirectory,
-      handoffDirectory: null,
+      handoffDirectory: written.handoffDirectory,
+      replayExportDirectory: written.replayExportDirectory,
+      replayIncomplete: written.replayIncomplete,
+      omittedTraceBytes: written.omittedTraceBytes,
       artifactName,
-      handoff: {
-        identity: captured?.identity ?? null,
-        execution: deps.execution,
-        captured: captured === null ? null : { baseSha: captured.baseSha, headSha: captured.headSha, mergeBaseSha: null, observedAt: captured.observedAt },
-        outcome,
-        backup: backup.receipt,
-        backupBody: backup.body,
-        configSource,
-        model: modelRecord,
-        artifactName,
-        replayArtifactName,
-        completedAt: new Date().toISOString(),
-        replayDirectory: replayRan ? replayDirectory : null,
-      },
-      exitCode: 1,
+      exitCode,
     }
   }
 
@@ -368,27 +379,20 @@ export async function runPrReview(command: PrReviewCommand, deps: PrReviewDepend
 
   if (captured.eligibility.kind === "skip") {
     const outcome: PrOutcome = { kind: "skipped", reason: captured.eligibility.reason, snapshot: null }
-    return {
+    return finalize({
+      identity: captured.identity,
+      execution: deps.execution,
+      captured: { baseSha: captured.baseSha, headSha: captured.headSha, mergeBaseSha: null, observedAt: captured.observedAt },
       outcome,
-      runDirectory: out,
-      handoffDirectory: null,
+      backup: backup.receipt,
+      backupBody: backup.body,
+      configSource: null,
+      model: modelRecord,
       artifactName,
-      handoff: {
-        identity: captured.identity,
-        execution: deps.execution,
-        captured: { baseSha: captured.baseSha, headSha: captured.headSha, mergeBaseSha: null, observedAt: captured.observedAt },
-        outcome,
-        backup: backup.receipt,
-        backupBody: backup.body,
-        configSource: null,
-        model: modelRecord,
-        artifactName,
-        replayArtifactName,
-        completedAt: new Date().toISOString(),
-        replayDirectory: null,
-      },
-      exitCode: 0,
-    }
+      replayArtifactName,
+      completedAt: new Date().toISOString(),
+      replayDirectory: null,
+    }, out, 0)
   }
 
   // Start removal even when preparation has expired. Only the wait is bounded, and a late
@@ -469,27 +473,20 @@ export async function runPrReview(command: PrReviewCommand, deps: PrReviewDepend
     mergeBaseSha: gitShaSchema.parse(result.snapshot.mergeBaseSha),
     observedAt: captured.observedAt,
   }
-  return {
+  return finalize({
+    identity: captured.identity,
+    execution: deps.execution,
+    captured: capturedSnapshot,
     outcome,
-    runDirectory: replayDirectory,
-    handoffDirectory: null,
+    backup: backup.receipt,
+    backupBody: backup.body,
+    configSource,
+    model: modelRecord,
     artifactName,
-    handoff: {
-      identity: captured.identity,
-      execution: deps.execution,
-      captured: capturedSnapshot,
-      outcome,
-      backup: backup.receipt,
-      backupBody: backup.body,
-      configSource,
-      model: modelRecord,
-      artifactName,
-      replayArtifactName,
-      completedAt: new Date().toISOString(),
-      replayDirectory,
-    },
-    exitCode: exitCodeFor(outcome),
-  }
+    replayArtifactName,
+    completedAt: new Date().toISOString(),
+    replayDirectory,
+  }, replayDirectory, exitCodeFor(outcome))
 }
 
 function reducePrRun(run: ReviewRun, execution: Execution, disposeFailure: Failure | null): PrOutcome {

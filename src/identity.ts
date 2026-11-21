@@ -19,3 +19,5 @@ export type PullRequestNumber = z.infer<typeof prNumberSchema>
 export type CommentId = z.infer<typeof commentIdSchema>
 export type Instant = z.infer<typeof instantSchema>
 export type RepositoryName = z.infer<typeof repositoryNameSchema>
+
+export const canonicalPrInputSchema = z.string().regex(/^[1-9][0-9]{0,9}$/).transform(Number).pipe(prNumberSchema)

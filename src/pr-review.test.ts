@@ -1,13 +1,16 @@
 import { afterAll, beforeAll, expect, test } from "bun:test"
 import { mkdirSync } from "node:fs"
-import { access, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { access, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { createHash } from "node:crypto"
+import { z } from "zod"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createBudget, systemClock, type Clock } from "./budget"
 import { createGitHubReader, readExecutionContext, type FetchLike, type FixedRepository, type GitHubReader, type GitObservation } from "./github"
 import { createJavaReviewRepository, type JavaReviewCommits } from "./fixtures/java-review"
+import { dispatchCommand, parseCommand } from "./cli"
 import { boundCoverageForPublication, runPrReview } from "./pr-review"
+import { backupReceiptSchema, reviewResultFileSchema, runManifestFileSchema } from "./handoff"
 import { runReview } from "./review"
 import type { Candidate, Verification } from "./contracts"
 import type { Failure } from "./pr-contracts"
@@ -27,6 +30,13 @@ const workflowResponse = {
 const botUser = { login: "github-actions[bot]", id: 41898282, type: "Bot" }
 const marker = "<!-- ai-code-review:v1 repo=123456789 pr=17 -->"
 const sha256 = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex")
+
+async function readHandoff(out: string) {
+  return {
+    result: reviewResultFileSchema.parse(JSON.parse(await readFile(join(out, "handoff", "review-result.json"), "utf8"))),
+    manifest: runManifestFileSchema.parse(JSON.parse(await readFile(join(out, "handoff", "run-manifest.json"), "utf8"))),
+  }
+}
 
 function manualClock(): Clock {
   return {
@@ -106,7 +116,7 @@ let origin: string
 let commits: JavaReviewCommits
 
 beforeAll(async () => {
-  root = await mkdtemp(join(tmpdir(), "pr-review-"))
+  root = await realpath(await mkdtemp(join(tmpdir(), "pr-review-")))
   repo = join(root, "repo")
   commits = await createJavaReviewRepository(repo)
   origin = join(root, "origin.git")
@@ -224,7 +234,9 @@ test("a PR review reproduces the local review over the same fixed objects", asyn
     observeGit: (invocation) => gitInvocations.push(invocation),
   })
   const out = join(root, "pr-run")
-  const outcome = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out }, {
+  const command = parseCommand(["review", "--repository", REPOSITORY, "--pr", "17", "--config", "review.config.json", "--out", out])
+  if (command.kind !== "review-pr") throw new Error("the PR CLI form did not parse")
+  const outcome = await runPrReview(command, {
     github,
     execution,
     progress: (event) => events.push(event),
@@ -239,7 +251,7 @@ test("a PR review reproduces the local review over the same fixed objects", asyn
   expect(outcome.outcome.result.snapshot).toEqual(local.artifacts.result.snapshot)
   expect(outcome.outcome.result.runId).toBe(execution.reviewRunId)
   expect(outcome.exitCode).toBe(0)
-  expect((await readdir(out)).sort()).toEqual(["replay"])
+  expect((await readdir(out)).sort()).toEqual(["handoff", "replay", "replay-export"])
   const replay = join(out, "replay")
   expect(JSON.parse(await readFile(join(replay, "result.json"), "utf8")).runId).toBe(execution.reviewRunId)
   expect(JSON.parse(await readFile(join(replay, "candidates.json"), "utf8")))
@@ -247,14 +259,16 @@ test("a PR review reproduces the local review over the same fixed objects", asyn
   expect(JSON.parse(await readFile(join(replay, "verifications.json"), "utf8")))
     .toEqual(JSON.parse(await readFile(join(root, "local-run", "verifications.json"), "utf8")))
   expect(outcome.runDirectory).toBe(replay)
-  expect(outcome.handoffDirectory).toBeNull()
-  expect(JSON.parse(JSON.stringify(outcome.handoff.identity))).toEqual({ repositoryId: "123456789", repository: REPOSITORY, pr: 17 })
-  expect(outcome.handoff.backup).toEqual({ kind: "absent" })
-  expect(outcome.handoff.configSource?.kind).toBe("product-default")
-  expect(outcome.handoff.model).toEqual({ providerId: "test", modelId: "reviewer" })
-  expect(outcome.handoff.artifactName).toBeNull()
-  expect(String(outcome.handoff.captured?.mergeBaseSha)).toBe(local.artifacts.result.snapshot.mergeBaseSha)
-  expect(outcome.handoff.replayDirectory).toBe(replay)
+  expect(outcome.handoffDirectory).toBe(join(out, "handoff"))
+  expect(outcome.replayExportDirectory).toBe(join(out, "replay-export"))
+  expect(outcome.replayIncomplete).toBe(false)
+  const handoff = await readHandoff(out)
+  expect(JSON.parse(JSON.stringify(handoff.result.identity))).toEqual({ repositoryId: "123456789", repository: REPOSITORY, pr: 17 })
+  expect(handoff.result.backup).toEqual({ kind: "absent" })
+  expect(handoff.manifest.config?.kind).toBe("product-default")
+  expect(handoff.manifest.model).toEqual({ providerId: "test", modelId: "reviewer" })
+  expect(handoff.manifest.artifactName).toBeNull()
+  expect(String(handoff.manifest.captured?.mergeBaseSha)).toBe(local.artifacts.result.snapshot.mergeBaseSha)
 
   const sequences = events.map(({ sequence }) => sequence)
   expect(new Set(sequences).size).toBe(sequences.length)
@@ -308,8 +322,9 @@ test("the API head wins over a wrong event SHA and the run binds to the Actions 
     expect(outcome.outcome.result.snapshot.baseSha).toBe(commits.baseSha)
     expect(outcome.outcome.result.runId).toBe("gh-987654321-1")
     expect(outcome.artifactName).toBe("ai-code-review-handoff-987654321-1")
-    expect(outcome.handoff.replayArtifactName).toBe("ai-code-review-replay-987654321-1")
-    expect(outcome.handoff.execution.reviewRunId).toBe("gh-987654321-1")
+    const handoff = await readHandoff(join(root, "pr-actions"))
+    expect(handoff.manifest.replayArtifactName).toBe("ai-code-review-replay-987654321-1")
+    expect(handoff.manifest.execution.reviewRunId).toBe("gh-987654321-1")
     expect(outcome.exitCode).toBe(0)
     // Detailed timing carries the workflow API's attempt start separately from command entry.
     const timing = JSON.parse(await readFile(join(root, "pr-actions", "replay", "timing.json"), "utf8"))
@@ -350,10 +365,10 @@ test("draft, closed, and fork captures skip without a model session or a Git com
     })
     expect(outcome.outcome).toEqual({ kind: "skipped", reason, snapshot: null })
     expect(outcome.exitCode).toBe(0)
-    expect(outcome.handoffDirectory).toBeNull()
-    expect(outcome.handoff.backup).toEqual({ kind: "absent" })
+    expect(outcome.handoffDirectory).toBe(join(out, "handoff"))
+    expect((await readHandoff(out)).result.backup).toEqual({ kind: "absent" })
     expect(gitInvocations).toEqual([])
-    expect(await readdir(out)).toEqual([])
+    expect((await readdir(out)).sort()).toEqual(["handoff", "replay", "replay-export"])
   }
 })
 
@@ -377,7 +392,6 @@ test("a capture failure produces a classified failed outcome without a snapshot"
   expect(outcome.outcome.snapshot).toBeNull()
   expect(outcome.exitCode).toBe(1)
   expect(outcome.runDirectory).toBe(out)
-  expect(outcome.handoff.captured).toBeNull()
   expect(outcome.handoffDirectory).toBeNull()
   expect(await readdir(out)).toEqual([])
 })
@@ -407,13 +421,13 @@ test("a missing captured object fails preparation as snapshot-fetch and invents 
   expect(outcome.outcome.failure.stage).toBe("preparation")
   expect(outcome.outcome.snapshot).toBeNull()
   expect(outcome.exitCode).toBe(1)
-  expect(JSON.parse(JSON.stringify(outcome.handoff.captured))).toEqual({
+  expect(JSON.parse(JSON.stringify((await readHandoff(out)).manifest.captured))).toEqual({
     baseSha: commits.baseSha,
     headSha: missingHead,
     mergeBaseSha: null,
     observedAt: "2026-11-21T00:00:00.000Z",
   })
-  expect(await readdir(out)).toEqual([])
+  expect(outcome.handoffDirectory).toBe(join(out, "handoff"))
 })
 
 test("a previous owned comment backs up bounded bytes and a read failure degrades to unavailable", async () => {
@@ -433,16 +447,20 @@ test("a previous owned comment backs up bounded bytes and a read failure degrade
     runWorker: worker,
   })
   expect(presentOutcome.outcome.kind).toBe("reviewed")
-  expect(JSON.parse(JSON.stringify(presentOutcome.handoff.backup))).toEqual({
+  const presentHandoff = await readHandoff(join(root, "backup-present"))
+  expect(JSON.parse(JSON.stringify(presentHandoff.result.backup))).toEqual({
     kind: "captured",
     commentId: "500",
     bodyDigest: sha256(body),
     updatedAt: "2026-11-21T09:30:00Z",
   })
-  // The saved body survives into the handoff, and its bytes verify against the receipt digest.
-  expect(presentOutcome.handoff.backupBody).toBe(body)
-  if (presentOutcome.handoff.backup.kind === "captured") {
-    expect(sha256(presentOutcome.handoff.backupBody!)).toBe(presentOutcome.handoff.backup.bodyDigest)
+  const savedBackup = z.strictObject({ body: z.string().nullable(), receipt: backupReceiptSchema }).parse(
+    JSON.parse(await readFile(join(root, "backup-present", "replay", "previous-comment.json"), "utf8")),
+  )
+  if (savedBackup.body === null) throw new Error("the saved backup body is absent")
+  expect(savedBackup.body).toBe(body)
+  if (savedBackup.receipt.kind === "captured") {
+    expect(sha256(savedBackup.body)).toBe(String(savedBackup.receipt.bodyDigest))
   } else throw new Error("unreachable")
 
   // Truncation cuts at a code-point boundary, so the saved bytes never exceed the 60,000-byte cap.
@@ -463,12 +481,13 @@ test("a previous owned comment backs up bounded bytes and a read failure degrade
     runWorker: worker,
   })
   expect(truncatedOutcome.outcome.kind).toBe("reviewed")
-  const truncatedBody = truncatedOutcome.handoff.backupBody!
+  const truncatedBody = (JSON.parse(await readFile(join(root, "backup-truncated", "replay", "previous-comment.json"), "utf8")) as { body: string }).body
   expect(Buffer.byteLength(truncatedBody, "utf8")).toBeLessThanOrEqual(60_000)
   // The character straddling the cap is dropped whole, so the cut stays clean.
   expect(truncatedBody).toBe(`${marker}\nx${"あ".repeat(19_983)}`)
-  if (truncatedOutcome.handoff.backup.kind === "captured") {
-    expect(sha256(truncatedBody)).toBe(truncatedOutcome.handoff.backup.bodyDigest)
+  const truncatedReceipt = (await readHandoff(join(root, "backup-truncated"))).result.backup
+  if (truncatedReceipt.kind === "captured") {
+    expect(sha256(truncatedBody)).toBe(truncatedReceipt.bodyDigest)
   } else throw new Error("unreachable")
 
   // A classified comment-list failure keeps its own code instead of flattening to unavailable.
@@ -495,8 +514,7 @@ test("a previous owned comment backs up bounded bytes and a read failure degrade
     runWorker: worker,
   })
   expect(crossOriginOutcome.outcome.kind).toBe("reviewed")
-  expect(crossOriginOutcome.handoff.backup).toEqual({ kind: "unavailable", code: "comment-list-limit" })
-  expect(crossOriginOutcome.handoff.backupBody).toBeNull()
+  expect((await readHandoff(join(root, "backup-cross-origin"))).result.backup).toEqual({ kind: "unavailable", code: "comment-list-limit" })
 
   const unavailable = apiFetch({
     pull: { response: pullFixture(commits.baseSha, commits.defectSha) },
@@ -512,7 +530,7 @@ test("a previous owned comment backs up bounded bytes and a read failure degrade
     runWorker: worker,
   })
   expect(unavailableOutcome.outcome.kind).toBe("reviewed")
-  expect(unavailableOutcome.handoff.backup).toEqual({ kind: "unavailable", code: "github-unavailable" })
+  expect((await readHandoff(join(root, "backup-unavailable"))).result.backup).toEqual({ kind: "unavailable", code: "github-unavailable" })
   expect(unavailableOutcome.exitCode).toBe(0)
   expect(unavailable.requests.filter((url) => url === COMMENTS_URL)).toHaveLength(3)
 })
@@ -714,7 +732,7 @@ test("an all-omitted change reviews without ever loading the model credential", 
     expect(outcome.outcome.result.issues).toHaveLength(0)
     expect(outcome.outcome.result.coverage.omittedPaths).toContain("secrets/token.txt")
     expect(outcome.exitCode).toBe(0)
-    expect(outcome.handoff.model).toEqual({ providerId: "test", modelId: "reviewer" })
+    expect((await readHandoff(join(root, "all-omitted"))).manifest.model).toEqual({ providerId: "test", modelId: "reviewer" })
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true })
   }
@@ -1143,3 +1161,106 @@ test.each(["rejected", "blank", "hanging"] as const)("%s fixed-repository dispos
     await tracked.cleanup()
   }
 }, 20_000)
+
+test("an exhausted read allowance with no pending pages stays partial locally and on a PR", async () => {
+  const runtime = completed([candidate], [keep])
+  runtime.readBudget.exhausted = true
+  const local = await runReview({ repo, base: commits.baseSha, head: commits.defectSha, out: join(root, "exhausted-local") }, { configuration, runWorker: async () => runtime })
+  const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, commits.defectSha) } })
+  const outcome = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out: join(root, "exhausted-pr") }, {
+    github: createGitHubReader({ GITHUB_TOKEN: "test" }, { fetch: api.fetchImpl, gitRemoteUrl: () => origin }),
+    execution: await localExecution(), progress: () => {}, model: () => configuration, modelIdentity: testModelIdentity,
+    budget: freshBudget(), runWorker: async () => runtime,
+  })
+  expect(local.artifacts.result.status).toBe("partial")
+  expect(outcome.outcome.kind).toBe("reviewed")
+  if (outcome.outcome.kind !== "reviewed") throw new Error("expected usable partial")
+  expect(outcome.outcome.result.status).toBe("partial")
+  expect(outcome.outcome.result.coverage.notes).toContain("The tool read budget was exhausted.")
+  expect(outcome.exitCode).toBe(0)
+})
+
+test("the replay export preserves every request, submission, and phase deadline", async () => {
+  const runtime = completed([candidate], [keep])
+  runtime.requests.records.push({ sequence: 1, phase: "discovery", sessionId: "discover", kind: "primary", attempt: 1,
+    startedAt: "2026-11-21T10:00:00Z", finishedAt: "2026-11-21T10:00:01Z", status: 200, outcome: "response" })
+  runtime.submission = { kind: "accepted", sessionId: "discover", userMessageId: "user-1", promptDigest: sha256("prompt") as Sha256 }
+  runtime.phaseDeadlines = { prepareInitEpochMs: 60_000, discoveryEpochMs: 180_000, analysisStopEpochMs: 290_000, workerKillEpochMs: 298_000, finalEpochMs: 300_000 }
+  const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, commits.defectSha) } })
+  const out = join(root, "request-export")
+  const outcome = await runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out }, {
+    github: createGitHubReader({ GITHUB_TOKEN: "test" }, { fetch: api.fetchImpl, gitRemoteUrl: () => origin }),
+    execution: await localExecution(), progress: () => {}, model: () => configuration, modelIdentity: testModelIdentity,
+    budget: freshBudget(), runWorker: async () => runtime,
+  })
+  expect(outcome.replayIncomplete).toBe(false)
+  const exported = JSON.parse(await readFile(join(out, "replay-export", "tool-trace.json"), "utf8"))
+  const ledger = JSON.parse(await readFile(join(out, "replay", "requests.json"), "utf8"))
+  expect(exported).toMatchObject(ledger)
+  expect(exported.requests.records).toHaveLength(1)
+})
+
+test.each(["direct", "symlink"] as const)("PR output inside the caller checkout through a %s parent rejects before capture", async (kind) => {
+  const parent = kind === "direct" ? repo : join(root, "caller-link")
+  if (kind === "symlink") await symlink(repo, parent)
+  const out = join(parent, `forbidden-${kind}`)
+  const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, commits.defectSha, { draft: true }) } })
+  try {
+    await expect(runPrReview({ repository: REPOSITORY, pr: 17, config: "review.config.json", out }, {
+      github: createGitHubReader({ GITHUB_TOKEN: "test" }, { fetch: api.fetchImpl }),
+      execution: await localExecution(), progress: () => {}, model: failingModel, modelIdentity: testModelIdentity,
+      budget: freshBudget(), callerDirectory: repo,
+    })).rejects.toThrow("outside")
+    expect(api.requests).toEqual([])
+    expect(await lstat(out).then(() => true, () => false)).toBe(false)
+  } finally { await rm(out, { recursive: true, force: true }) }
+})
+
+test.each(["complete", "partial", "skipped", "preparation-failed", "runtime-failed", "capture-failed", "interrupted"] as const)("the production dispatcher reports a handled %s PR journey", async (journey) => {
+  const noChanges = journey === "skipped"
+  const api = apiFetch({ pull: { response: pullFixture(commits.baseSha, noChanges ? commits.baseSha : commits.defectSha), notFound: journey === "capture-failed" } })
+  const stdout: string[] = []
+  const stderr: string[] = []
+  const out = join(root, `dispatch-${journey}`)
+  const runtime = journey === "interrupted" ? failedSessionRuntime({ code: "verification-timeout", discoveryText: JSON.stringify({ candidates: [candidate] }), verificationText: null, cleanup: { hostClosed: true, forced: false } }) : completed([candidate], [keep])
+  if (journey === "partial") runtime.readBudget.exhausted = true
+  const verificationSession = runtime.sessions[1]
+  if (journey === "runtime-failed" && verificationSession?.status === "complete") verificationSession.text = "{broken JSON"
+  const exitCode = await dispatchCommand(["review", "--repository", REPOSITORY, "--pr", "17", "--out", out,
+    ...(journey === "preparation-failed" ? ["--config", "absent.json"] : [])], {
+    stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line),
+    prDependencies: async () => ({
+      github: createGitHubReader({ GITHUB_TOKEN: "test" }, { fetch: api.fetchImpl, gitRemoteUrl: () => origin }),
+      execution: await localExecution(), progress: () => {}, model: () => configuration, modelIdentity: testModelIdentity,
+      budget: freshBudget(), runWorker: async () => runtime,
+    }),
+  })
+  expect(stdout).toHaveLength(1)
+  expect(stderr).toEqual([])
+  const summary = JSON.parse(stdout[0]!)
+  expect(summary.handoffDirectory).toBe(journey === "capture-failed" ? null : join(await realpath(out), "handoff"))
+  const expectedKind = journey.endsWith("failed") ? "failed" : journey === "skipped" ? "skipped" : "reviewed"
+  expect(summary.outcome.kind).toBe(expectedKind)
+  if (expectedKind === "reviewed") expect(summary.outcome.result.status).toBe(journey === "interrupted" ? "partial" : journey)
+  expect(exitCode).toBe(journey.endsWith("failed") || journey === "interrupted" ? 1 : 0)
+  if (summary.handoffDirectory !== null) expect((await readHandoff(out)).result.outcome).toEqual(summary.outcome)
+})
+
+test.each(["skipped", "preparation-failed"] as const)("a captured canonical body survives the %s path without analysis", async (journey) => {
+  const body = `${marker}\nprevious report`
+  const api = apiFetch({
+    pull: { response: pullFixture(commits.baseSha, commits.defectSha, { draft: journey === "skipped" }) },
+    comments: { list: [{ id: 123, body, created_at: "2026-11-21T09:00:00Z", updated_at: "2026-11-21T09:30:00Z", user: botUser }] },
+  })
+  const out = join(root, `backup-without-analysis-${journey}`)
+  const outcome = await runPrReview({ repository: REPOSITORY, pr: 17, config: journey === "skipped" ? "review.config.json" : "absent.json", out }, {
+    github: createGitHubReader({ GITHUB_TOKEN: "test" }, { fetch: api.fetchImpl, gitRemoteUrl: () => origin }),
+    execution: await localExecution(), progress: () => {}, model: failingModel, modelIdentity: testModelIdentity,
+    budget: freshBudget(), runWorker: async () => { throw new Error("analysis must not start") },
+  })
+  expect(outcome.outcome.kind).toBe(journey === "skipped" ? "skipped" : "failed")
+  expect((await readHandoff(out)).result.backup.kind).toBe("captured")
+  const saved = JSON.parse(await readFile(join(out, "replay-export", "previous-comment.json"), "utf8"))
+  expect(saved.body).toBe(body)
+  expect(saved.receipt.bodyDigest).toBe(sha256(body))
+})

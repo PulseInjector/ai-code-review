@@ -116,16 +116,17 @@ export const MAX_PUBLISHED_ISSUES = 5
 // These refinements are shared by the legacy local result and the widened PR result, so both
 // boundaries reject the same terminal-state contradictions. The predicates take structural
 // supertypes of both inferred outputs.
-export const completeResultCoversAllWork = (result: {
-  status: string
-  coverage: { omittedPaths: readonly unknown[]; unverifiedCandidateIds: readonly unknown[]; unpublishedCandidateIds: readonly unknown[] }
+export function deriveReviewStatus(result: {
+  coverage: { omittedPaths: readonly unknown[]; unverifiedCandidateIds: readonly unknown[]; unpublishedCandidateIds: readonly unknown[]; notes: readonly unknown[] }
   stageErrors: readonly unknown[]
-}): boolean => result.status !== "complete" || (
-  result.coverage.omittedPaths.length === 0 &&
-  result.coverage.unverifiedCandidateIds.length === 0 &&
-  result.coverage.unpublishedCandidateIds.length === 0 &&
-  result.stageErrors.length === 0
-)
+}, pendingToolPages = 0): "complete" | "partial" {
+  return pendingToolPages === 0 && result.coverage.omittedPaths.length === 0 &&
+    result.coverage.unverifiedCandidateIds.length === 0 && result.coverage.unpublishedCandidateIds.length === 0 &&
+    result.coverage.notes.length === 0 && result.stageErrors.length === 0 ? "complete" : "partial"
+}
+
+export const completeResultCoversAllWork = (result: Parameters<typeof deriveReviewStatus>[0] & { status: string }): boolean =>
+  result.status !== "complete" || deriveReviewStatus(result) === "complete"
 
 export const terminalResultPublishesNoIssues = (result: { status: string; issues: readonly unknown[] }): boolean =>
   (result.status !== "failed" && result.status !== "skipped") || result.issues.length === 0

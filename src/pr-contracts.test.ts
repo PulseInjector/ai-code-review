@@ -509,3 +509,9 @@ test("reviewed outcomes require an assembled result", () => {
     failure: { code: "run-interrupted", stage: "verification", message: "stopped" },
   }), "input-invalid", /assembled review result/)
 })
+
+test("an exhausted read-budget note survives terminal reduction without pending pages", () => {
+  const partial: PrReviewResult = { ...keptResult, status: "partial", coverage: { ...keptResult.coverage, notes: ["The tool read budget was exhausted."] } }
+  expectReviewed(reduceTerminalReview({ execution, checkpoint: verifiedCheckpoint, result: partial, pendingToolPages: 0 }), "partial")
+  expectRejected(reduceTerminalReview({ execution, checkpoint: verifiedCheckpoint, result: { ...partial, status: "complete" }, pendingToolPages: 0 }), "input-invalid", /derived status partial/)
+})

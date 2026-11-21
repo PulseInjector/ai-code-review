@@ -93,3 +93,15 @@ Run artifacts include:
 The 300-second budget covers preparation, worker initialization, both sessions, cleanup, and reporting. Git commands share the remaining deadline; the parent interrupts the worker before its deadline and kills its process group if needed. Credential files and the worker's temporary HOME are removed when it exits.
 
 The command writes one JSON summary to stdout. Exit code `0` means `complete`, `partial`, or `skipped`; findings do not make this advisory tool fail. Exit code `1` means a failed review or invalid command. Inspect `result.status` and coverage before interpreting zero findings. With no changed files it skips model calls. If all changed files are omitted, it reports `partial` without starting a model. Invalid input or snapshot preparation fails before a run directory is published; errors after preparation retain a failure report and available replay records.
+
+## Pull request review
+
+Use the PR form to capture the current API snapshot and run the same local reviewer:
+
+```sh
+bun run src/cli.ts review --repository PulseInjector/java-review --pr 17 --config review.config.json --out /path/to/new-run-directory
+```
+
+`--config` defaults to `review.config.json` in the captured base commit. GitHub reads require `GITHUB_TOKEN`. Analysis also uses the four `REVIEW_MODEL_*` settings described above.
+
+The new output directory contains `handoff/` with exactly `review-result.json` and `run-manifest.json`. It also contains `replay/` and an allowlisted `replay-export/`. The replay export is capped at 64 MiB. If the cap omits files, `replay/artifact-omissions.json` records the omitted bytes and the JSON summary sets `replayIncomplete` to `true`.

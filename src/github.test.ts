@@ -873,6 +873,25 @@ test("readFixedLines serves fixed-commit lines under the existing line rules", a
   }
 })
 
+test("readFixedSnapshot recomputes the merge base and changed head paths from fixed objects", async () => {
+  const fixture = await repositoryFixture({
+    files: { "src/A.java": "class A {}\n", "src/Stable.java": "class Stable {}\n" },
+    headFiles: { "src/A.java": "class A { void changed() {} }\n", "src/New.java": "class New {}\n" },
+  })
+  try {
+    const evidence = await reader({ origin: fixture.origin }).readFixedSnapshot({
+      identity,
+      baseSha: gitShaSchema.parse(fixture.baseSha),
+      headSha: gitShaSchema.parse(fixture.headSha),
+      budget: budget(),
+    })
+    expect(String(evidence.mergeBaseSha)).toBe(fixture.baseSha)
+    expect(evidence.changedHeadPaths).toEqual(["src/A.java", "src/New.java"])
+  } finally {
+    await fixture.dispose()
+  }
+})
+
 const actionsEnv = (eventPath: string, overrides: Record<string, string> = {}): NodeJS.ProcessEnv => ({
   GITHUB_REPOSITORY: "PulseInjector/java-review",
   GITHUB_REPOSITORY_ID: "123456789",
@@ -994,4 +1013,30 @@ test("an oversized event payload fails before parsing", async () => {
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test("fixed snapshot citations share a 16 MiB aggregate read allowance", async () => {
+  const large = "x".repeat(8 * 1024 * 1024)
+  const fixture = await repositoryFixture({ files: { "a.txt": large, "b.txt": large, "c.txt": large } })
+  try {
+    await expectGitHubError(reader({ origin: fixture.origin }).readFixedSnapshot({
+      identity, baseSha: gitShaSchema.parse(fixture.baseSha), headSha: gitShaSchema.parse(fixture.headSha), budget: budget(),
+      sources: ["a.txt", "b.txt", "c.txt"].map((path) => ({ side: "head" as const, path })),
+    }), "citation-invalid")
+  } finally { await fixture.dispose() }
+})
+
+test("fixed citation reads fetch once and charge repeated references only once", async () => {
+  const large = "x".repeat(8 * 1024 * 1024)
+  const fixture = await repositoryFixture({ files: { "a.txt": large, "b.txt": large } })
+  const invocations: GitObservation[] = []
+  try {
+    const evidence = await reader({ origin: fixture.origin, observeGit: (invocation) => invocations.push(invocation) }).readFixedSnapshot({
+      identity, baseSha: gitShaSchema.parse(fixture.baseSha), headSha: gitShaSchema.parse(fixture.headSha), budget: budget(),
+      sources: [{ side: "head", path: "a.txt" }, { side: "head", path: "b.txt" }, { side: "head", path: "a.txt" }, { side: "merge-base", path: "a.txt" }],
+    })
+    expect(evidence.sources.map(({ text }) => text.length)).toEqual([large.length, large.length, large.length, large.length])
+    expect(invocations.filter(({ args }) => args.includes("fetch"))).toHaveLength(1)
+    expect(invocations.filter(({ args }) => args.includes("cat-file") && args.includes("blob"))).toHaveLength(2)
+  } finally { await fixture.dispose() }
 })
