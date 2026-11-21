@@ -1,8 +1,8 @@
 import { z } from "zod"
 
 const shaSchema = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)
-const identifierSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/)
-const textSchema = z.string().trim().min(1).max(2_000)
+export const identifierSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/)
+export const textSchema = z.string().trim().min(1).max(2_000)
 
 export const relativePathSchema = z.string().min(1).max(1_024).refine((path) => {
   if (path.includes("\\") || path.includes("\0") || path.startsWith("/")) return false
@@ -111,11 +111,30 @@ const usageSchema = z.discriminatedUnion("kind", [
   }),
 ])
 
-export const reviewResultSchema = z.strictObject({
+export const MAX_PUBLISHED_ISSUES = 5
+
+// These refinements are shared by the legacy local result and the widened PR result, so both
+// boundaries reject the same terminal-state contradictions. The predicates take structural
+// supertypes of both inferred outputs.
+export const completeResultCoversAllWork = (result: {
+  status: string
+  coverage: { omittedPaths: readonly unknown[]; unverifiedCandidateIds: readonly unknown[]; unpublishedCandidateIds: readonly unknown[] }
+  stageErrors: readonly unknown[]
+}): boolean => result.status !== "complete" || (
+  result.coverage.omittedPaths.length === 0 &&
+  result.coverage.unverifiedCandidateIds.length === 0 &&
+  result.coverage.unpublishedCandidateIds.length === 0 &&
+  result.stageErrors.length === 0
+)
+
+export const terminalResultPublishesNoIssues = (result: { status: string; issues: readonly unknown[] }): boolean =>
+  (result.status !== "failed" && result.status !== "skipped") || result.issues.length === 0
+
+export const reviewResultObjectSchema = z.strictObject({
   runId: identifierSchema,
   snapshot: snapshotSchema,
   status: z.enum(["complete", "partial", "failed", "skipped"]),
-  issues: z.array(verifiedIssueSchema).max(5),
+  issues: z.array(verifiedIssueSchema).max(MAX_PUBLISHED_ISSUES),
   coverage: coverageSchema,
   stageErrors: z.array(stageErrorSchema),
   usage: usageSchema,
@@ -127,24 +146,54 @@ export const reviewResultSchema = z.strictObject({
     verifyPrompt: textSchema,
   }),
   durationMs: z.int().nonnegative(),
-}).refine((result) => result.status !== "complete" || (
-  result.coverage.omittedPaths.length === 0 &&
-  result.coverage.unverifiedCandidateIds.length === 0 &&
-  result.coverage.unpublishedCandidateIds.length === 0 &&
-  result.stageErrors.length === 0
-), {
-  message: "complete results cannot have uncovered work or stage errors",
-}).refine((result) => !["failed", "skipped"].includes(result.status) || result.issues.length === 0, {
-  message: "failed and skipped results cannot publish issues",
 })
+
+export const reviewResultSchema = reviewResultObjectSchema
+  .refine(completeResultCoversAllWork, {
+    message: "complete results cannot have uncovered work or stage errors",
+  }).refine(terminalResultPublishesNoIssues, {
+    message: "failed and skipped results cannot publish issues",
+  })
 
 export type Snapshot = z.infer<typeof snapshotSchema>
 export type CodeReference = z.infer<typeof codeReferenceSchema>
 export type Candidate = z.infer<typeof candidateSchema>
 export type DiscoveryOutput = z.infer<typeof discoveryOutputSchema>
 export type Verification = z.infer<typeof verificationSchema>
+export type KeptVerification = z.infer<typeof keptVerificationSchema>
 export type VerificationOutput = z.infer<typeof verificationOutputSchema>
 export type ReviewResult = z.infer<typeof reviewResultSchema>
+
+export type PublishedIssue = { candidate: Candidate; verification: KeptVerification }
+
+// The assembler and the PR checkpoint reducer must publish accepted keeps identically: discovery
+// order, deduplicated by change location and normalized root cause, capped for publication, with
+// keeps past the cap reported as unpublished instead of silently dropped.
+export function deriveKeepPublication(candidates: readonly Candidate[], verifications: readonly Verification[]): {
+  published: PublishedIssue[]
+  unpublishedCandidateIds: string[]
+} {
+  const byId = new Map(verifications.map((verification) => [verification.candidateId, verification]))
+  const seen = new Set<string>()
+  const deduped: PublishedIssue[] = []
+  for (const candidate of candidates) {
+    const verification = byId.get(candidate.id)
+    if (verification?.decision !== "keep") continue
+    const key = JSON.stringify([
+      candidate.changeLocation.path,
+      candidate.changeLocation.startLine,
+      candidate.changeLocation.endLine,
+      candidate.rootCause.trim().replace(/\s+/gu, " ").toLowerCase(),
+    ])
+    if (seen.has(key)) continue
+    seen.add(key)
+    deduped.push({ candidate, verification })
+  }
+  return {
+    published: deduped.slice(0, MAX_PUBLISHED_ISSUES),
+    unpublishedCandidateIds: deduped.slice(MAX_PUBLISHED_ISSUES).map(({ candidate }) => candidate.id),
+  }
+}
 
 export const parseSnapshot = (value: unknown): Snapshot => snapshotSchema.parse(value)
 export const parseCandidate = (value: unknown): Candidate => candidateSchema.parse(value)

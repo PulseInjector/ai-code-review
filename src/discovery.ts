@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 import type { ContextManifest } from "./context"
-import type { Candidate, Verification } from "./contracts"
+import { deriveKeepPublication, type Candidate, type Verification } from "./contracts"
 import { loadModelConfiguration, runIsolatedWorker, RUNTIME_TIMEOUT_MS, type WorkerOptions } from "./runtime/worker-process"
 import { defaultReadLimits, type PhaseValidation, type RuntimeResult } from "./runtime/contracts"
 import { validateDiscoveryText, validateVerificationText } from "./phase-validation"
@@ -106,22 +106,13 @@ export async function runDiscoveryAndVerification(options: {
     stage = "verification"
     const verifications = await validateVerificationText(runtime.sessions[1].text, candidates, prompts.phaseValidation, options.materialDirectory)
 
-    const byId = new Map(verifications.map((verification) => [verification.candidateId, verification]))
-    const seen = new Set<string>()
-    const issues = candidates.flatMap((candidate) => {
-      const verification = byId.get(candidate.id)
-      if (verification?.decision !== "keep") return []
-      const key = JSON.stringify([candidate.changeLocation.path, candidate.changeLocation.startLine, candidate.changeLocation.endLine, candidate.rootCause.trim().replace(/\s+/gu, " ").toLowerCase()])
-      if (seen.has(key)) return []
-      seen.add(key)
-      return [{ candidate, verification }]
-    })
+    const { published: issues, unpublishedCandidateIds: unreportedCandidateIds } = deriveKeepPublication(candidates, verifications)
     return {
       candidates,
       verifications,
-      issues: issues.slice(0, 5),
+      issues,
       unknownCandidateIds: verifications.filter(({ decision }) => decision === "unknown").map(({ candidateId }) => candidateId),
-      unreportedCandidateIds: issues.slice(5).map(({ candidate }) => candidate.id),
+      unreportedCandidateIds,
       versions: prompts.versions,
       runtime,
     }
