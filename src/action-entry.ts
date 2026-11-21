@@ -3,7 +3,7 @@ import { isAbsolute, join } from "node:path"
 import { z } from "zod"
 import { relativePathSchema } from "./contracts"
 import { attemptSchema, canonicalPrInputSchema, repositoryNameSchema, runIdSchema } from "./identity"
-import { jobResultSchema } from "./pr-contracts"
+import { failureSchema, jobResultSchema } from "./pr-contracts"
 import { readProductIdentity } from "./product-identity"
 
 export type ActionCommand = { argv: string[]; cwd: string; env: NodeJS.ProcessEnv }
@@ -21,6 +21,24 @@ const reviewSummary = z.object({ outcome: z.discriminatedUnion("kind", [
 ]) })
 const publishSummary = z.object({ publication: z.object({ kind: z.enum(["published", "retained", "rejected", "failed"]) }), commentId: z.string().nullable() })
 
+function failureMessage(error: unknown, env: NodeJS.ProcessEnv): string {
+  let message = error instanceof Error ? error.stack ?? error.message : "the Action command failed"
+  const credentials = [env.GITHUB_TOKEN, ...(env.REVIEW_ACTION_MODE === "review" ? [env.REVIEW_MODEL_API_KEY] : [])]
+    .filter((value): value is string => value !== undefined && value !== "")
+    .sort((left, right) => right.length - left.length)
+  for (const credential of credentials) message = message.replaceAll(credential, "[redacted]")
+  message = message.replaceAll("::", ": :").replace(/[\r\n]+/gu, " ")
+  let bounded = ""
+  let bytes = 0
+  for (const character of message) {
+    const characterBytes = Buffer.byteLength(character)
+    if (bytes + characterBytes > 2_000) break
+    bounded += character
+    bytes += characterBytes
+  }
+  return bounded || "the Action command failed"
+}
+
 async function execute({ argv, cwd, env }: ActionCommand): Promise<CommandResult> {
   const child = Bun.spawn(argv, { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "inherit" })
   const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()])
@@ -33,6 +51,7 @@ export async function runAction(env: NodeJS.ProcessEnv = process.env, deps: Acti
   const mode = env.REVIEW_ACTION_MODE
   const key = mode === "review" ? env.REVIEW_MODEL_API_KEY : undefined
   if (key) stdout(`::add-mask::${key.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A")}\n`)
+  let stage: "input" | "initialization" = "input"
   try {
     if (mode !== "review" && mode !== "publish") throw new Error("Action mode must be review or publish")
     const runId = runIdSchema.parse(env.GITHUB_RUN_ID)
@@ -68,6 +87,7 @@ export async function runAction(env: NodeJS.ProcessEnv = process.env, deps: Acti
       const jobResult = jobResultSchema.parse(env.REVIEW_JOB_RESULT)
       argv.push("publish", "--repository", repository, "--pr", String(pr), "--package", join(runnerTemp, "ai-code-review-download"), "--review-job-result", jobResult)
     }
+    stage = "initialization"
     const result = await (deps.execute ?? execute)({ argv, cwd: directory, env: childEnv })
     stdout(result.stdout)
     if (result.stdout.trim() !== "") {
@@ -83,8 +103,13 @@ export async function runAction(env: NodeJS.ProcessEnv = process.env, deps: Acti
       await appendFile(outputFile, `status=${outputs.status}\ncomment-id=${outputs["comment-id"]}\n`)
     }
     return result.exitCode === 0 ? 0 : 1
-  } catch {
-    stderr("The Action command failed validation or execution.\n")
+  } catch (error) {
+    const failure = failureSchema.parse({
+      code: stage === "input" || error instanceof z.ZodError ? "input-invalid" : "runtime-init",
+      stage,
+      message: failureMessage(error, env),
+    })
+    stderr(`[${failure.code}] ${failure.message}\n`)
     return 1
   }
 }

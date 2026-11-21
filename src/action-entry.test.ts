@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { runAction, type ActionCommand } from "./action-entry"
@@ -12,9 +12,13 @@ async function fixture(mode = "review") {
   temporary.push(root)
   const product = join(root, "product $; ' path")
   await symlink(join(import.meta.dir, ".."), product)
+  const eventPath = join(root, "event.json")
+  await writeFile(eventPath, JSON.stringify({ inputs: { pr: "17" } }))
   const env: NodeJS.ProcessEnv = {
     GITHUB_ACTION_PATH: product, REVIEW_PRODUCT_DIRECTORY: product, REVIEW_PRODUCT_COMMIT: "a".repeat(40),
     RUNNER_TEMP: root, GITHUB_RUN_ID: "1234", GITHUB_RUN_ATTEMPT: "2", GITHUB_REPOSITORY: "owner/repo",
+    GITHUB_REPOSITORY_ID: "987654321", GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_EVENT_PATH: eventPath,
+    GITHUB_SERVER_URL: "https://github.com",
     GITHUB_OUTPUT: join(root, "outputs"), REVIEW_ACTION_MODE: mode, REVIEW_ACTION_PR: "17",
     REVIEW_ACTION_CONFIG: "rules/config $; '.json", REVIEW_MODEL_API_KEY: "mask%\r\nkey",
     REVIEW_JOB_RESULT: "failure", REVIEW_DOWNLOAD_OUTCOME: "failure",
@@ -74,6 +78,26 @@ test("an entry preflight failure masks the key before its diagnostic", async () 
   f.env.REVIEW_PRODUCT_COMMIT = "main"
   expect(await runAction(f.env, { execute: f.execute, stdout: (s) => f.logs.push(s), stderr: (s) => f.logs.push(s) })).toBe(1)
   expect(f.logs[0]).toStartWith("::add-mask::")
-  expect(f.logs[1]).toBe("The Action command failed validation or execution.\n")
+  expect(f.logs[1]).toContain("[input-invalid]")
+  expect(f.logs[1]).not.toContain("main")
   expect(f.calls).toHaveLength(0)
+})
+
+test.each(["review", "publish"])("a %s execution failure reports its sanitized cause", async (mode) => {
+  const f = await fixture(mode)
+  f.env.GITHUB_TOKEN = "fake-github-token"
+  if (mode === "publish") {
+    for (const name of ["REVIEW_MODEL_API_KEY", "REVIEW_MODEL_ID", "REVIEW_MODEL_BASE_URL", "REVIEW_MODEL_PROVIDER_ID"]) {
+      Object.defineProperty(f.env, name, { enumerable: true, get() { throw new Error("publish read model environment") } })
+    }
+  }
+  expect(await runAction(f.env, {
+    execute: async () => { throw new Error(`spawn failed with ${mode === "review" ? f.env.REVIEW_MODEL_API_KEY : f.env.GITHUB_TOKEN}`) },
+    stdout: (s) => f.logs.push(s), stderr: (s) => f.logs.push(s),
+  })).toBe(1)
+  const diagnostic = f.logs.at(-1)!
+  expect(diagnostic).toContain("[runtime-init]")
+  expect(diagnostic).toContain("spawn failed with [redacted]")
+  expect(diagnostic).not.toContain("mask%")
+  expect(diagnostic).not.toContain("fake-github-token")
 })
