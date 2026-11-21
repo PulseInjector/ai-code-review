@@ -35,7 +35,7 @@ jobs:
     steps:
       - name: Review current PR
         id: review
-        uses: PulseInjector/ai-code-review@9040e776b7fdb4017e10bfa53dfe95139bde3642
+        uses: PulseInjector/ai-code-review@ac913ef997c5a40cd5010a32e0a9ad854b9a998a
         with:
           mode: review
           config: ${{ inputs.config }}
@@ -82,7 +82,7 @@ jobs:
           path: ${{ runner.temp }}/ai-code-review-download
       - name: Publish validated feedback
         if: ${{ !cancelled() }}
-        uses: PulseInjector/ai-code-review@9040e776b7fdb4017e10bfa53dfe95139bde3642
+        uses: PulseInjector/ai-code-review@ac913ef997c5a40cd5010a32e0a9ad854b9a998a
         with:
           mode: publish
           config: ${{ inputs.config }}
