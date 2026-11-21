@@ -21,8 +21,8 @@ Preconditions:
 
 - `bun run verify doctor` reports Java and javac as runnable.
 
-- **Toolchain.** Run `bun run verify --area java`. The temporary Java program compiles and prints the expected success marker.
-- **Fixture outcomes.** The fixture tests require base and fix to pass, the injected defect to fail, and the guarded branch to pass. The test process exits `0` only when all four behaviors match.
+- **Toolchain.** Run `bun run verify --area java`. The temporary Java program compiles and runs; the smoke captures the success marker and prints `{"smoke":"java-toolchain","status":"passed"}`.
+- **Fixture outcomes.** The fixture tests require the pinned SHAs to match, the commit topology to hold, and base and fix to pass, the injected defect to fail, and the guarded branch to pass. The test process exits `0` only when all of these hold.
 - **Proof.** Inspect the printed evidence directory's command logs and `summary.json`; the fixture test must have exit code `0`.
 
 ## Gotchas
