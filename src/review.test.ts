@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { createJavaReviewRepository, type JavaReviewCommits } from "./fixtures/java-review"
 import { runReview } from "./review"
 import type { Candidate, Verification } from "./contracts"
+import type { Sha256 } from "./identity"
 import { emptyReadBudget, type RuntimeResult } from "./runtime/contracts"
 
 let root: string
@@ -35,6 +36,8 @@ function completed(candidates: Candidate[], verifications: Verification[]): Runt
       { name: "verify", status: "complete", text: JSON.stringify({ verifications }), usage: { kind: "known", inputTokens: 7, outputTokens: 3 }, durationMs: 12 },
     ],
     usage: { kind: "known", inputTokens: 12, outputTokens: 5 }, readBudget: emptyReadBudget(), cleanup: { hostClosed: true, forced: false },
+    checkpointSequence: 1, submission: { kind: "accepted", sessionId: "session", userMessageId: "message", promptDigest: "a".repeat(64) as Sha256 },
+    requests: { records: [], capped: false }, phaseDeadlines: null,
   }
 }
 
@@ -44,7 +47,10 @@ function input(name: string) {
 
 test("writes replayable reports and exact verified evidence from a fixed snapshot", async () => {
   const run = await runReview(input("complete with spaces"), { configuration, runWorker: async (options) => {
-    expect(options.deadline).toBeGreaterThan(Date.now())
+    const deadlines = options.phaseDeadlines
+    if (deadlines === undefined) throw new Error("the review must pass absolute phase deadlines to the worker")
+    expect(deadlines.analysisStopEpochMs).toBeGreaterThan(Date.now())
+    expect(deadlines.prepareInitEpochMs).toBeLessThanOrEqual(deadlines.analysisStopEpochMs)
     expect(options.timeoutMs).toBeLessThanOrEqual(300_000)
     return completed([candidate], [keep])
   } })
@@ -92,7 +98,7 @@ test("malformed discovery and out-of-range citations fail in discovery", async (
 test("interrupted verification preserves known discovery candidates and unknown usage", async () => {
   const runtime = completed([candidate], [])
   runtime.sessions.splice(1)
-  const failed: RuntimeResult = { ...runtime, status: "timeout", error: "worker exceeded the run deadline", usage: { kind: "unknown", reason: "active verification usage was not settled" }, cleanup: { hostClosed: false, forced: true } }
+  const failed: RuntimeResult = { ...runtime, status: "timeout", error: "worker exceeded the run deadline", code: "verification-timeout", usage: { kind: "unknown", reason: "active verification usage was not settled" }, cleanup: { hostClosed: false, forced: true } }
   const run = await runReview(input("timeout"), { configuration, runWorker: async () => failed })
   expect(run.artifacts.result.status).toBe("failed")
   expect(run.artifacts.result.stageErrors[0]?.stage).toBe("verification")

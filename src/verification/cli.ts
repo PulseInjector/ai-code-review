@@ -4,7 +4,7 @@ import { join } from "node:path"
 import pkg from "../../package.json"
 
 const root = join(import.meta.dir, "../..")
-const areas = ["cli", "snapshot", "runtime", "java"] as const
+const areas = ["cli", "snapshot", "runtime", "github", "java"] as const
 type Area = (typeof areas)[number]
 type Mode = { kind: "local"; area?: Area } | { kind: "live" } | { kind: "doctor"; live: boolean } | { kind: "help" }
 const usage = `Usage: bun run verify [--area ${areas.join("|")} | --live]\n       bun run verify doctor [--live]`
@@ -87,7 +87,7 @@ async function verify(mode: Extract<Mode, { kind: "local" | "live" }>): Promise<
   const commands: { name: string; argv: string[]; exitCode: number; durationMs: number; stdout: string; stderr: string }[] = []
   const drive: Drive = async (name, argv, overrides) => {
     const started = Date.now()
-    const result = await execute(argv, { ...env, ...overrides }, live ? 1_000_000 : 120_000)
+    const result = await execute(argv, { ...env, ...overrides }, live ? 1_000_000 : name === "tests" ? 180_000 : 120_000)
       .catch((error: unknown) => ({ exitCode: 1, stdout: "", stderr: String(error) }))
     const stdout = `${name}.stdout.txt`
     const stderr = `${name}.stderr.txt`
@@ -109,7 +109,11 @@ async function verify(mode: Extract<Mode, { kind: "local" | "live" }>): Promise<
   const local: Record<Area, Check[]> = {
     cli: [cli("cli")],
     snapshot: [cli("snapshot"), command("snapshot-tests", test("src/context.test.ts", "src/report.test.ts"))],
-    runtime: [sdk, command("runtime-tests", test("src/runtime/runtime.test.ts", "src/runtime/worker-process.test.ts"))],
+    runtime: [sdk, command("runtime-tests", test("src/runtime/runtime.test.ts", "src/runtime/worker-process.test.ts", "src/runtime/request-policy.test.ts", "src/runtime/scripted-provider.test.ts"))],
+    github: [{ name: "github journeys", run: async () => {
+      const { verifyGithubCli } = await import("./github-cli")
+      await verifyGithubCli(drive)
+    } }],
     java: [java, command("java-fixtures", test("src/fixtures/java-review.test.ts"))],
   }
   const checks = live ? [command("model", run("smoke:model")), command("acceptance", run("smoke:review"))]

@@ -19,7 +19,16 @@ verified finding. The guarded case published none. The incomplete-material
 case reported partial coverage. `bun run smoke:review` reruns the three live
 cases.
 
-Segment 2, GitHub PR feedback, is next. It has not started.
+Segment 2, GitHub PR feedback, is implemented on the
+`feat/segment-2-pr-review` integration branch. Its implementation design is
+[docs/segment-2-design.md](docs/segment-2-design.md), and the branch contains
+the implementation and deterministic checks for checkpoints 1 through 7.
+The GitHub area verification passes. Live workflow evidence is incomplete:
+the latest diagnostic run used no model key, failed review, and reached a
+publish permission denial. It did not prove the normal live review and publish
+path. Follow-up evidence is tracked in issue #14. The stage-two integration
+pull request is the next delivery step; do not treat the incomplete live row
+as a passed acceptance result.
 
 ## Goal and scope
 
@@ -222,8 +231,8 @@ the same review entry.
    find the `type: "idle"` message after this input, and check that
    `outcome` is `succeeded`, `failed`, or `interrupted`. Poll once per second
    as a backstop for missed events. The idle state at session creation never
-   counts as success. On success, take the last assistant text before the
-   terminal state, check for assistant and idle errors, and read the
+   counts as success. On success, select the validated result-tool submission within that
+   prompt-to-idle interval, check for assistant and idle errors, and read the
    cumulative usage from `host.sessions.get({ sessionID })`. Per-step messages
    serve phase analysis and cumulative fields serve the totals. Never add
    both. In `finally`, cancel the event subscription and `await host.close()`.
@@ -244,13 +253,19 @@ the same review entry.
    existing behavior, and counter-evidence for each candidate. It never
    receives the discovery session's reasoning.
 
-   The first version uses "the final text is exactly one JSON object" plus
-   `JSON.parse` and application-level field validation. The v2.2.7 prompt
-   contract has no `json_schema` parameter, so this is not server-enforced
-   structured output. A refusal, incomplete output, or a structure error is a
-   failure. Never auto-repair JSON and never run a secret extra round. At
-   most 8 candidates enter, and at most 5 new issues publish. The excess and
-   any candidate left unverified by the budget go into coverage.
+   Review phases submit results through schema-declared plugin tools. Discovery
+   uses `review_submit_discovery` and verification uses
+   `review_submit_verification`. The fixed v2.2.7 prompt API has no
+   `json_schema` parameter. Tool schemas derive from the existing domain
+   schemas, and the program checks exact source evidence before accepting a
+   submission. The OpenAI-compatible request hook requires tool use until
+   acceptance and disables further calls afterward. It preserves the SDK
+   step cap and runs before request-policy accounting. The model can correct rejected tool arguments within the same
+   SDK loop and original budgets. No outer repair prompt or JSON repair is
+   allowed. Final assistant prose never supplies review results. A refusal,
+   incomplete turn, or absence of a valid submission remains a failure.
+   At most 8 candidates enter, and at most 5 new issues publish. The excess
+   and any candidate left unverified by the budget go into coverage.
    Insufficient material yields `unknown`, which never publishes.
 
    `context-limits.ts` registers a product plugin with
@@ -363,6 +378,11 @@ acceptance passes, open one pull request from the integration branch to
 
 ## Segment 2: reliable feedback on a PR
 
+The implementation design is
+[docs/segment-2-design.md](docs/segment-2-design.md). Its checkpoint sequence
+governs implementation order. This section remains the authority for scope
+and acceptance.
+
 ### Goal
 
 A PR that is opened, updated, reopened, or marked ready gets reviewed
@@ -374,121 +394,74 @@ segment 3.
 
 ### Steps
 
-1. **Connect the local entry to real PRs.** Add `src/github.ts` and
-   `src/publish.ts`, and extend the CLI with `review/publish`.
-   `review --repository owner/repo --pr N` re-queries the PR at start and
-   saves the repository ID, the PR number, the current base, head, and merge
-   base, the trigger time, the actual start time, and the workflow run ID and
-   attempt. It reads the previous product comment as the old-report backup.
-   Take the head from the API, never from the event payload or the Actions
-   default merge ref. Draft, closed, and fork PRs produce `skipped` with a
-   reason.
+1. **Connect the local entry to a live pull request.** The `review` command
+   accepts a repository and a pull request number, re-reads the pull request
+   at the actual start, and records the identity and commits of that run. It
+   takes the head commit from the API, never from the event payload or the
+   Actions merge ref. Draft, closed, and fork pull requests produce `skipped`
+   with a reason. The run reads its rules from the frozen base commit, so a
+   pull request edit cannot change them. The first live check compares a real
+   pull request run with the same run from a local checkout.
 
-   Fetch the fixed objects into a dedicated directory, reusing segment 1's
-   Git export and snapshot logic. Read the product configuration from the
-   frozen base, so a PR edit to configuration cannot change this run's
-   rules. First create a real PR on the self-built Java repository, run the
-   same `review` entry, and confirm the artifacts match the local run.
+2. **Build the two-job workflow.** The root Action runs the fixed product
+   program in `review` or `publish` mode. The reusable workflow calls the
+   Action from a review job with read access and from a publish job with
+   comment write access. The model secret goes only to the review job. The
+   caller workflow covers the pull request events and a manual dispatch input
+   for the pull request number. The caller workflow lives in
+   `examples/caller.yml`. Callers pin the workflow commit, and the workflow
+   pins the Action commit. Pull request content only becomes analysis
+   material. It never runs as product code.
 
-2. **Build the two-job workflow.** Add the root `action.yml`, a composite
-   Action with `mode`, `config`, and `pr` inputs that calls the fixed product
-   program, and `.github/workflows/review.yml`, a `workflow_call` workflow
-   that takes the PR number, the model configuration, and one model secret.
-   The review job gets `contents: read` and `pull-requests: read`, and the
-   model secret goes only to the review step. The publish job gets its read
-   permissions plus `pull-requests: write`, receives no model secret, and
-   runs no model. Put the caller event workflow in `examples/caller.yml`,
-   with `pull_request` types `opened`, `synchronize`, `reopened`,
-   `ready_for_review`, and `edited`, plus a `workflow_dispatch` PR input.
+3. **Hand one validated package from review to publish.** Each review run
+   writes a result file and a run manifest. The manifest binds the package to
+   the repository, the pull request, the commits, the product and runtime
+   versions, the prompt and configuration hashes, the model identity, and the
+   result digests. The review job uploads the package even when it fails. The
+   publish job downloads only the current run's package, validates its
+   identity, schemas, commits, and citations, and writes nothing when
+   validation fails. A digest alone does not make a package trusted. A missing
+   package produces a failure note from the review job result. A failure note
+   never makes a failed review job green.
 
-   The composite Action locates the product directory through
-   `GITHUB_ACTION_PATH`, installs the pinned Bun, runs
-   `bun install --frozen-lockfile` there, and calls the CLI. The target
-   repository goes into a separate input directory. The product program comes
-   from a fixed product commit, and PR content only generates analysis
-   material. A same-named script in the PR workspace never runs. Commit the
-   runnable Action first, then the reusable workflow that references it, and
-   have callers pin the workflow commit. GitHub's reusable-workflow rules for
-   inputs, secrets, permission inheritance, and artifact handoff follow the
-   official docs.
+4. **Map run states to feedback.** `complete` means the agreed scope finished,
+   with or without issues. `partial` means work remains, and verified partial
+   results may appear. `failed` means the run produced no usable result.
+   `skipped` means the review never started. The last successful report stays
+   available after a later failure. The whole run keeps one 300-second budget,
+   with phase caps inside that total. The product retries a transient 429 or
+   network error at most twice, and the retry time comes from the same budget.
+   If an accepted prompt times out, the worker recovers it from the same
+   session and never resends it. The outer layer never retries an accepted
+   run. Credential and model configuration errors fail outright. A phase
+   without a valid result-tool submission fails. Rejected tool arguments can
+   receive feedback inside the original SDK loop and budgets.
 
-3. **Define one handoff package per run.** The review job produces
-   `review-result.json` and `run-manifest.json`, and the artifact name
-   contains the run ID and attempt. The manifest holds the repository, PR,
-   and commits, the program and runtime versions, the prompt and config
-   hashes, the model identifier, and the result-file digests. Detailed
-   traces are stored separately. The upload step also runs when the review
-   job fails.
+   Progress goes to the Actions logs and the job summary. The pull request
+   comment changes only at the end. Round count, token use, and output caps
+   are observable stop conditions, not a billing cap.
 
-   The publish job downloads only this run's artifact, then validates its
-   identity, SHAs, schema, size, and citations. A digest alone never makes an
-   arbitrary artifact trusted. The publish job waits with `needs` and runs
-   when the review failed but the workflow was not cancelled. When no
-   artifact exists, it writes a failure note from `needs.review.result`.
-   Normal-failure tests must cover this branch. A handled failure still
-   leaves Actions in a failed state, so writing the note never turns the
-   review job green. A missing valid artifact and "the model returned zero
-   issues" are two different outcomes.
+5. **Render and publish deterministically.** The summary comment carries a
+   fixed product marker, the repository and pull request identity, the head it
+   covers, the run link, the status, and the readable issues. Model text is
+   escaped as plain content. The publisher finds its own comment by bot
+   identity and marker, updates it when present, and creates it only when
+   absent. A lost create response is reconciled by reading the comment list
+   first. The product never creates a second comment after an uncertain
+   response. Duplicate markers produce one canonical comment and a reported
+   count. The product updates its own comments and never modifies human ones.
 
-4. **Translate run states into feedback.** `complete` means the agreed scope
-   finished, with or without issues. `partial` means uncovered files remain,
-   verification is unfinished, or the budget cut the run short, and already
-   verified partial results may be shown. `failed` means no usable result
-   this run. `skipped` means the review never started. The previous report is
-   kept separately as the last result, and a later failure never clears it.
-
-   The base budget stays at 300 seconds: preparation and initialization at
-   most 60 seconds, discovery at most 120 seconds, verification in the
-   remaining time, and the final 10 seconds reserved for cleanup. These are
-   caps inside one total deadline, not added durations. Check the remaining
-   budget before each new request. Retry a 429 or a transient network or
-   service error at most twice with backoff, and the backoff time counts
-   too. On a timeout with unknown acceptance, read the same session's
-   messages first instead of resending the prompt. The outer layer never
-   retries an already accepted run. Internal retries consume the same total
-   deadline, and the run records the actual requests and usage. Credential,
-   model configuration, and result format errors fail outright.
-
-   Progress goes to the Actions stage logs and the job summary: the current
-   phase, the files and candidates processed, the remaining time, and the run
-   link. The PR comment is updated only at the end, so progress never
-   spams comments. Round count, tokens, and output caps are observable stop
-   conditions, not a precise billing cap, because usage reporting lags.
-
-5. **Render deterministically and publish repeatably.** The comment carries
-   a fixed product marker, the repository and PR identity, the head it
-   covers, a run link, a status summary, and readable issues. Model text is
-   escaped as plain content. The publisher lists the PR comments with
-   pagination, finds the one comment by bot identity and product marker,
-   updates it when found, and creates it only when not found. If a create
-   succeeded but the response was lost, the retry queries by marker first
-   and never blindly creates again. Read requests may retry a limited number
-   of times. When the outcome of a side-effecting request is unknown,
-   confirm the existing state first. The state schema for this segment stores
-   `lastReport`, the last successful report, and `lastPublishedRun`.
-   Segment 3 extends it with issue state. When historical duplicate markers
-   are found, pick one canonical comment, report the duplication, and stop
-   creating new ones. The product updates its own comments and never
-   modifies human ones. Publishing uses the issue comments API.
-
-6. **Finish continuous pushes and the publish boundary in one pass.** The
-   whole reusable workflow uses one concurrency group per product,
-   repository, and PR, with `cancel-in-progress: false` and the default
-   single pending slot. Configure it only at this layer. A caller reusing
-   the same group would wait on itself. A newer pending run can replace an
-   older one, so every start re-reads the PR.
-
-   Before publishing, re-fetch the PR's open state and its base and head. A
-   mismatch with this run marks the run stale and leaves the valid report in
-   place. Only a matching run and attempt may publish. After writing, query
-   the commits again. If H2 landed between validation and write, the
-   just-written report is annotated with its H1, marked stale, and updated
-   by the next or a manual run. The check and the write are not atomic, so
-   the promise is that reports are bound to a commit and stale results are
-   handled, never that every instant is current. If publishing itself fails,
-   Actions keeps the result and the failure entry, and a PR note is not
-   guaranteed. A base update does not necessarily trigger this product's
-   event, so the manual rerun path is documented.
+6. **Keep continuous pushes and the publish boundary honest.** One
+   concurrency group covers a product, a repository, and a pull request, with
+   `cancel-in-progress: false` and the default single pending slot. Every
+   start re-reads the pull request. Before a write, the publisher re-reads the
+   open state and the base and head. A mismatch marks the run stale and keeps
+   the valid report in place. Only a matching run and attempt may publish.
+   After the write, the publisher checks the commits again and marks a changed
+   head stale. The check and the write are not atomic, so the product promises
+   commit-bound reports and stale handling, not an always-current report. A
+   base update does not necessarily trigger the product event, so the manual
+   rerun path stays documented.
 
 ### Acceptance
 
@@ -853,7 +826,9 @@ Keep the source, the tests, the prompts, the fixed fixtures, and the truth
 labels in the repository. Keep run artifacts outside it. This plan is the
 source for scope, order, dependencies, and acceptance. A pull request holds
 its own discussion, checks, review outcome, and current status, and this
-plan does not duplicate them.
+plan does not duplicate them. The segment design records the implementation
+shape. This plan states scope, order, dependencies, and acceptance, and
+points to the design for detail.
 
 When a segment's real implementation differs from a step written here, update
 the step in the same pull request that changes the behavior. When a segment
