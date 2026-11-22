@@ -4,7 +4,7 @@ import { safeLoad } from "js-yaml"
 import { gitShaSchema } from "../src/identity"
 import { renderCallerWorkflow, renderReusableWorkflow } from "./workflows"
 
-const actionCommit = gitShaSchema.parse("e101a3b0e65dc0ab97256eae351437d9f4d633fd")
+const actionCommit = gitShaSchema.parse("62cb46daff641c63eff8fbc2f93d919c48cef26d")
 const workflowCommit = gitShaSchema.parse("1234567890abcdef1234567890abcdef12345678")
 
 test("the reusable workflow preserves the two-job privilege boundary and failure evidence", () => {
@@ -36,7 +36,7 @@ test("the reusable workflow preserves the two-job privilege boundary and failure
           {
             name: "Review current PR",
             id: "review",
-            uses: "PulseInjector/ai-code-review@e101a3b0e65dc0ab97256eae351437d9f4d633fd",
+            uses: `PulseInjector/ai-code-review@${actionCommit}`,
             with: {
               mode: "review",
               config: "${{ inputs.config }}",
@@ -95,7 +95,7 @@ test("the reusable workflow preserves the two-job privilege boundary and failure
           {
             name: "Publish validated feedback",
             if: "${{ !cancelled() }}",
-            uses: "PulseInjector/ai-code-review@e101a3b0e65dc0ab97256eae351437d9f4d633fd",
+            uses: `PulseInjector/ai-code-review@${actionCommit}`,
             with: { mode: "publish", config: "${{ inputs.config }}", pr: "${{ inputs.pr }}" },
             env: {
               GITHUB_TOKEN: "${{ github.token }}",
