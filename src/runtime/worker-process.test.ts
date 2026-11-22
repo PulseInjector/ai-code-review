@@ -21,7 +21,7 @@ function modelResponse(text: string) {
 
 const workerPath = join(import.meta.dir, "worker.ts")
 
-for (const scenario of ["malformed", "excerpt", "path", "conflict", "duplicate", "wrong-phase", "prose-only", "truncated", "required-choice"] as const) {
+for (const scenario of ["malformed", "excerpt", "path", "conflict", "duplicate", "wrong-phase", "prose-only", "truncated", "required-choice", "step-cap"] as const) {
   test(`structured review submission handles ${scenario} without weakening evidence validation`, async () => {
     const root = await mkdtemp(join(tmpdir(), "review-submission-case-"))
     const material = join(root, "material")
@@ -34,6 +34,7 @@ for (const scenario of ["malformed", "excerpt", "path", "conflict", "duplicate",
       const index = requests.length
       const choice = z.object({ tool_choice: z.string().optional() }).parse(JSON.parse(requests.at(-1)!)).tool_choice
       if (scenario === "required-choice" && choice !== "required") return modelResponse("Done")
+      if (scenario === "step-cap") return choice === "none" ? modelResponse("Step limit reached") : resultToolResponse("read", JSON.stringify({ path: "head/change.txt" }))
       if (scenario === "prose-only") return modelResponse(json)
       if (scenario === "wrong-phase" && index === 1) return resultToolResponse("review_submit_verification", '{"verifications":[]}')
       if (scenario === "malformed" && index === 1) return resultToolResponse("review_submit_discovery", json + "]}")
@@ -60,7 +61,7 @@ for (const scenario of ["malformed", "excerpt", "path", "conflict", "duplicate",
         prompts: [{ name: "discover", text: "Discover the change through the result tool." }],
       })
       const phase = result.sessions[0]
-      if (["conflict", "wrong-phase", "prose-only", "truncated"].includes(scenario)) {
+      if (["conflict", "wrong-phase", "prose-only", "truncated", "step-cap"].includes(scenario)) {
         expect(result.status).toBe("failed")
         expect(phase?.status).toBe("failed")
         expect(phase).not.toHaveProperty("text")
@@ -75,6 +76,10 @@ for (const scenario of ["malformed", "excerpt", "path", "conflict", "duplicate",
       expect(result.requests.records).toHaveLength(requests.length)
       expect(result.requests.records.every((record) => record.status === 200 && record.outcome === "response")).toBe(true)
       expect(z.object({ tool_choice: z.string() }).parse(JSON.parse(requests[0]!)).tool_choice).toBe("required")
+      if (scenario === "step-cap") {
+        expect(requests).toHaveLength(12)
+        expect(z.object({ tool_choice: z.string() }).parse(JSON.parse(requests.at(-1)!)).tool_choice).toBe("none")
+      }
       expect(result.cleanup).toEqual({ hostClosed: true, forced: false })
     } finally {
       await server.stop(true)

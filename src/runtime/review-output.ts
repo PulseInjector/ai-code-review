@@ -58,8 +58,8 @@ export function createReviewOutput(options: { validation: PhaseValidation; mater
         const requestHook = await ctx.session.hook("http.request", async (event) => {
           const binding = bindings.get(event.sessionID)
           if (event.kind !== "primary" || !binding) return
-          const body = z.looseObject({ tools: z.array(z.unknown()).optional() }).parse(await event.request.clone().json())
-          if (!body.tools?.length) return
+          const body = z.looseObject({ tools: z.array(z.unknown()).optional(), tool_choice: z.unknown().optional() }).parse(await event.request.clone().json())
+          if (!body.tools?.length || body.tool_choice === "none") return
           const headers = new Headers(event.request.headers)
           headers.delete("content-length")
           event.request = new Request(event.request, {
