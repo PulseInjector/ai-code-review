@@ -19,16 +19,26 @@ verified finding. The guarded case published none. The incomplete-material
 case reported partial coverage. `bun run smoke:review` reruns the three live
 cases.
 
-Segment 2, GitHub PR feedback, is implemented on the
-`feat/segment-2-pr-review` integration branch. Its implementation design is
-[docs/segment-2-design.md](docs/segment-2-design.md), and the branch contains
-the implementation and deterministic checks for checkpoints 1 through 7.
-The GitHub area verification passes. Live workflow evidence is incomplete:
-the latest diagnostic run used no model key, failed review, and reached a
-publish permission denial. It did not prove the normal live review and publish
-path. Follow-up evidence is tracked in issue #14. The stage-two integration
-pull request is the next delivery step; do not treat the incomplete live row
-as a passed acceptance result.
+Segment 2, GitHub PR feedback, merged through pull request #15 on 2026-11-22.
+Its implementation design is [docs/segment-2-design.md](docs/segment-2-design.md).
+The deterministic GitHub verification passes. Final pinned live runs reached
+the provider and published failure notes, but did not prove a successful
+review. Issue #14 tracks the defect, guarded, manual-repeat, and remaining
+live evidence. Do not treat the merged implementation as passed live acceptance.
+
+## Verification tooling proposal
+
+[The verification tooling design](docs/verification-tooling-design.md) proposes
+named checks and retained evidence for AI diagnosis and focused Segment 3
+development. It is a design proposal, not an implemented command contract or
+a replacement for the acceptance rows below.
+
+Its implementation checkpoints are evidence retention and inspection, catalog
+selection and exact receipts, semantic replay and the provider contract probe,
+then GitHub collection and acceptance. Segment 3 registers its state journeys
+as the corresponding behavior is implemented. Each checkpoint has deterministic
+proof and separately identified live evidence in the design. Follow the
+repository's design approval and integration-branch workflow before implementation.
 
 ## Goal and scope
 
