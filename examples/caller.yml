@@ -14,7 +14,7 @@ permissions:
   actions: read
 jobs:
   review:
-    uses: PulseInjector/ai-code-review/.github/workflows/review.yml@b7948e2d99cded28a8bebf1f9cab8c19660fc4af
+    uses: PulseInjector/ai-code-review/.github/workflows/review.yml@1b9ca0bb8d3dbe8664f32d25a2df94e6aa15d929
     with:
       pr: ${{ github.event.pull_request.number && format('{0}', github.event.pull_request.number) || inputs.pr }}
       config: review.config.json

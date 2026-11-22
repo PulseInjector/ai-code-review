@@ -19,11 +19,16 @@ verified finding. The guarded case published none. The incomplete-material
 case reported partial coverage. `bun run smoke:review` reruns the three live
 cases.
 
-Segment 2, GitHub PR feedback, is in progress on the
-`feat/segment-2-pr-review` integration branch. The implementation design is
-[docs/segment-2-design.md](docs/segment-2-design.md). The branch has commits
-for implementation checkpoints 1 through 7, and the standing documents
-describe the implemented interfaces. The segment has not merged to `main`.
+Segment 2, GitHub PR feedback, is implemented on the
+`feat/segment-2-pr-review` integration branch. Its implementation design is
+[docs/segment-2-design.md](docs/segment-2-design.md), and the branch contains
+the implementation and deterministic checks for checkpoints 1 through 7.
+The GitHub area verification passes. Live workflow evidence is incomplete:
+the latest diagnostic run used no model key, failed review, and reached a
+publish permission denial. It did not prove the normal live review and publish
+path. Follow-up evidence is tracked in issue #14. The stage-two integration
+pull request is the next delivery step; do not treat the incomplete live row
+as a passed acceptance result.
 
 ## Goal and scope
 
