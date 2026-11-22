@@ -80,6 +80,7 @@ test("runs two phases and never publishes a candidate rejected by caller protect
   } finally { await rm(state.root, { recursive: true, force: true }) }
 })
 
+
 test("rejects malformed model JSON and incomplete verification coverage", async () => {
   const state = await fixture()
   try {
@@ -100,6 +101,19 @@ test("rejects citations that do not match an included snapshot line", async () =
     const output = runtimeResult(JSON.stringify({ candidates: [invalid] }), JSON.stringify({ verifications: [] }))
     await expect(runDiscoveryAndVerification(options(state.context, state.materialDirectory, state.root, mockWorker(output))))
       .rejects.toThrow("citation excerpt does not match")
+  } finally { await rm(state.root, { recursive: true, force: true }) }
+})
+
+test("rejects a verification path that repeats the snapshot side prefix", async () => {
+  const state = await fixture()
+  try {
+    const verification = JSON.stringify({ verifications: [{
+      candidateId: "C-1", decision: "keep", reason: "The caller iterates the returned value.",
+      evidence: [{ ...candidate.citations[0], path: `head/${candidate.citations[0]!.path}` }],
+    }] })
+    const output = runtimeResult(JSON.stringify({ candidates: [candidate] }), verification)
+    await expect(runDiscoveryAndVerification(options(state.context, state.materialDirectory, state.root, mockWorker(output))))
+      .rejects.toThrow("citation is not present in the prepared head snapshot")
   } finally { await rm(state.root, { recursive: true, force: true }) }
 })
 

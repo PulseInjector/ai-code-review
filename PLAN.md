@@ -226,8 +226,8 @@ the same review entry.
    find the `type: "idle"` message after this input, and check that
    `outcome` is `succeeded`, `failed`, or `interrupted`. Poll once per second
    as a backstop for missed events. The idle state at session creation never
-   counts as success. On success, take the last assistant text before the
-   terminal state, check for assistant and idle errors, and read the
+   counts as success. On success, select the validated result-tool submission within that
+   prompt-to-idle interval, check for assistant and idle errors, and read the
    cumulative usage from `host.sessions.get({ sessionID })`. Per-step messages
    serve phase analysis and cumulative fields serve the totals. Never add
    both. In `finally`, cancel the event subscription and `await host.close()`.
@@ -248,13 +248,17 @@ the same review entry.
    existing behavior, and counter-evidence for each candidate. It never
    receives the discovery session's reasoning.
 
-   The first version uses "the final text is exactly one JSON object" plus
-   `JSON.parse` and application-level field validation. The v2.2.7 prompt
-   contract has no `json_schema` parameter, so this is not server-enforced
-   structured output. A refusal, incomplete output, or a structure error is a
-   failure. Never auto-repair JSON and never run a secret extra round. At
-   most 8 candidates enter, and at most 5 new issues publish. The excess and
-   any candidate left unverified by the budget go into coverage.
+   Review phases submit results through schema-declared plugin tools. Discovery
+   uses `review_submit_discovery` and verification uses
+   `review_submit_verification`. The fixed v2.2.7 prompt API has no
+   `json_schema` parameter. Tool schemas derive from the existing domain
+   schemas, and the program checks exact source evidence before accepting a
+   submission. The model can correct rejected tool arguments within the same
+   SDK loop and original budgets. No outer repair prompt or JSON repair is
+   allowed. Final assistant prose never supplies review results. A refusal,
+   incomplete turn, or absence of a valid submission remains a failure.
+   At most 8 candidates enter, and at most 5 new issues publish. The excess
+   and any candidate left unverified by the budget go into coverage.
    Insufficient material yields `unknown`, which never publishes.
 
    `context-limits.ts` registers a product plugin with
@@ -422,8 +426,9 @@ segment 3.
    network error at most twice, and the retry time comes from the same budget.
    If an accepted prompt times out, the worker recovers it from the same
    session and never resends it. The outer layer never retries an accepted
-   run. Credential, model configuration, and result format errors fail
-   outright.
+   run. Credential and model configuration errors fail outright. A phase
+   without a valid result-tool submission fails. Rejected tool arguments can
+   receive feedback inside the original SDK loop and budgets.
 
    Progress goes to the Actions logs and the job summary. The pull request
    comment changes only at the end. Round count, token use, and output caps

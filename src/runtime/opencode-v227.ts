@@ -12,6 +12,7 @@ import {
 } from "./contracts"
 import { validateDiscoveryText, validateVerificationText } from "../phase-validation"
 import type { Candidate } from "../contracts"
+import { collectReviewOutput, createReviewOutput, reviewOutputTool, type ReviewPhase } from "./review-output"
 
 export type RuntimeHost = Pick<OpenCode.Interface, "sessions" | "message" | "events" | "model" | "close">
 export function resolvePhasePrompt(prompt: string, previousOutput?: string): string {
@@ -21,13 +22,17 @@ export function resolvePhasePrompt(prompt: string, previousOutput?: string): str
   return prompt.replace(marker, () => previousOutput)
 }
 
-export const readOnlyPermissions = () => [
-  { action: "*", resource: "*", effect: "deny" as const },
-  { action: "read", resource: "*", effect: "allow" as const },
-  { action: "grep", resource: "*", effect: "allow" as const },
-  { action: "glob", resource: "*", effect: "allow" as const },
-  { action: "external_directory", resource: "*", effect: "deny" as const },
-]
+export function readOnlyPermissions(phaseName?: string) {
+  const outputTool = phaseName ? reviewOutputTool(phaseName) : undefined
+  return [
+    { action: "*", resource: "*", effect: "deny" as const },
+    { action: "read", resource: "*", effect: "allow" as const },
+    { action: "grep", resource: "*", effect: "allow" as const },
+    { action: "glob", resource: "*", effect: "allow" as const },
+    ...(outputTool ? [{ action: outputTool, resource: "*", effect: "allow" as const }] : []),
+    { action: "external_directory", resource: "*", effect: "deny" as const },
+  ]
+}
 
 export function completedTurn(messages: SessionMessageInfo[], promptID: string) {
   const start = messages.findIndex((message) => message.type === "user" && message.id === promptID)
@@ -186,12 +191,14 @@ async function runSession(options: {
   phase: PhaseState
   policy: RequestPolicy
   reportSubmission: (submission: Submission) => void
+  reviewOutput: ReturnType<typeof createReviewOutput>
+  reviewPhase?: ReviewPhase
   now?: () => number
 }): Promise<PhaseResult> {
   const { host, input, prompt, signal, stopped, phase, policy, reportSubmission } = options
   const now = options.now ?? (() => Date.now())
   const session = await host.sessions.create({
-    location: { directory: input.materialDirectory }, model: { providerID: input.model.providerID, id: input.model.modelID }, permissions: readOnlyPermissions(),
+    location: { directory: input.materialDirectory }, model: { providerID: input.model.providerID, id: input.model.modelID }, permissions: readOnlyPermissions(prompt.name),
   })
   const sessionID = session.id
   const eventController = new AbortController()
@@ -207,6 +214,7 @@ async function runSession(options: {
   }
   signal.addEventListener("abort", onAbort, { once: true })
   let usage = unknownUsage("session usage was not settled")
+  let releaseOutput = () => {}
   const interruptedCode = (): Failure["code"] => stopped() === "read-budget-exhausted" ? "read-budget"
     : signal.reason === "discovery-timeout" || signal.reason === "verification-timeout" ? stageTimeoutCode(phase.phase) : "run-interrupted"
   const interruptedResult = (): PhaseResult => ({
@@ -214,6 +222,7 @@ async function runSession(options: {
     error: "runtime stopped before the session settled", code: interruptedCode(), usage,
   })
   try {
+    if (options.reviewPhase) releaseOutput = options.reviewOutput.bind(sessionID, { phase: options.reviewPhase, signal, deadlineEpochMs: phase.deadlineEpochMs })
     if (signal.aborted) onAbort()
     if (interruptRequested) return interruptedResult()
     // Advancing the lazy stream and observing server.connected proves subscription before the prompt.
@@ -253,18 +262,24 @@ async function runSession(options: {
         const stats = await host.sessions.get({ sessionID })
         usage = { kind: "known", inputTokens: stats.tokens.input, outputTokens: stats.tokens.output }
         const terminalError = idle.error ?? last?.error
-        const text = last?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n").trim()
-        if (last?.finish === "content-filter") {
-          return { name: prompt.name, sessionID, status: "failed", error: "the model stopped on the provider content filter", code: "model-refusal", usage }
+        const output = options.reviewPhase ? collectReviewOutput(options.reviewPhase.name, completed.assistants) : undefined
+        const outputSubmissions = output?.trace
+        const text = output?.kind === "complete" ? output.text : last?.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n").trim()
+        if (completed.assistants.some((assistant) => assistant.finish === "content-filter")) {
+          return { name: prompt.name, sessionID, status: "failed", error: "the model stopped on the provider content filter", code: "model-refusal", usage, outputSubmissions }
         }
         if (terminalError || idle.outcome !== "succeeded") {
           const code = sessionFailureCode(terminalError, policy, sessionID)
-          return { name: prompt.name, sessionID, status: code === stageTimeoutCode(phase.phase) ? "timeout" : "failed", error: terminalError?.message ?? "model session failed", code, usage }
+          return { name: prompt.name, sessionID, status: code === stageTimeoutCode(phase.phase) ? "timeout" : "failed", error: terminalError?.message ?? "model session failed", code, usage, outputSubmissions }
         }
-        if (!text || last?.finish === "length" || last?.finish === "error" || Buffer.byteLength(text) > 256 * 1024) {
-          return { name: prompt.name, sessionID, status: "failed", error: "model returned no usable complete assistant text", code: "model-format", usage }
+        if (output?.kind === "failed") {
+          const error = boundedErrorText(output.error)
+          return { name: prompt.name, sessionID, status: "failed", error, code: validationFailureCode(error), usage, outputSubmissions, rawText: output.rawText }
         }
-        return { name: prompt.name, sessionID, status: "complete", text, usage }
+        if (!text || completed.assistants.some((assistant) => assistant.finish === "length" || assistant.finish === "error") || Buffer.byteLength(text) > 256 * 1024) {
+          return { name: prompt.name, sessionID, status: "failed", error: "model returned no usable complete assistant text", code: "model-format", usage, outputSubmissions }
+        }
+        return { name: prompt.name, sessionID, status: "complete", text, usage, outputSubmissions }
       }
       if (now() >= phase.deadlineEpochMs) {
         return { name: prompt.name, sessionID, status: "timeout", error: "the phase deadline elapsed before the session settled",
@@ -281,6 +296,7 @@ async function runSession(options: {
       } finally { if (timer) clearTimeout(timer) }
     }
   } finally {
+    releaseOutput()
     signal.removeEventListener("abort", onAbort)
     eventController.abort()
     await iterator.return?.()
@@ -354,6 +370,9 @@ export async function runRuntime(
       phase: () => phaseState,
       onChange: emitProgress,
     })
+    const reviewOutput = createReviewOutput({
+      validation: input.phaseValidation ?? { changedHeadPaths: [], includedFiles: [] }, materialDirectory: input.materialDirectory,
+    })
     const creating = createHost({
       fetch: modelTransportFetch,
       config: {
@@ -368,7 +387,7 @@ export async function runRuntime(
       models: { fetch: false }, fs: { filewatcher: false },
       plugins: [createContextLimitsPlugin({ limits: input.readLimits, budget, materialDirectory: input.materialDirectory,
         onChange: emitProgress, onExhausted: () => { stopped = "read-budget-exhausted"; controller.abort() } }),
-        policy.plugin],
+        policy.plugin, reviewOutput.plugin],
     })
     void creating.then((created) => {
       if (abandonedCreate) created.close().catch(() => undefined)
@@ -409,7 +428,9 @@ export async function runRuntime(
       emitProgress()
       phaseActive = true
       const phaseStarted = Date.now()
-      const settled = await runSession({ host, input, prompt: { ...prompt, text }, signal: controller.signal, stopped: () => stopped, phase: phaseState, policy, reportSubmission: (value) => { submission = value; emitProgress() } })
+      const reviewPhase: ReviewPhase | undefined = prompt.name === "discover" ? { name: "discover" }
+        : prompt.name === "verify" ? { name: "verify", candidates: discovered ?? [] } : undefined
+      const settled = await runSession({ host, input, prompt: { ...prompt, text }, signal: controller.signal, stopped: () => stopped, phase: phaseState, policy, reviewOutput, reviewPhase, reportSubmission: (value) => { submission = value; emitProgress() } })
       let result = settled
       if (settled.status === "complete") {
         const { text, ...phase } = settled
@@ -424,7 +445,7 @@ export async function runRuntime(
           } else if (validated.value !== undefined) discovered = validated.value
         } catch (error) {
           const message = boundedErrorText(error)
-          result = { ...phase, status: "failed", error: message, code: validationFailureCode(message) }
+          result = { ...phase, status: "failed", error: message, code: validationFailureCode(message), rawText: text }
         }
       }
       phaseActive = false

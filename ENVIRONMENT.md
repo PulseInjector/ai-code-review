@@ -87,8 +87,8 @@ Run artifacts include:
 | --- | --- |
 | `result.json`, `report.md` | Final status, at most five verified issues, code evidence, coverage, duration, usage, and version hashes. |
 | `manifest.json`, `input.json`, `material/` | Fixed commits, input inventory, inclusion/omission reasons, text snapshots, and patches. |
-| `configuration.json`, `prompts.json`, `versions.json` | Non-secret model/settings, rendered discovery prompt and verification template, and source/config/prompt hashes. The verification template's marker is replaced with the discovery session's final JSON. |
-| `candidates.json`, `verifications.json`, `sessions.json` | Structured decisions and raw final phase text, including invalid output retained on failure. |
+| `configuration.json`, `prompts.json`, `versions.json` | Non-secret model/settings, rendered discovery prompt and verification template, and source/config/prompt hashes. The verification template's marker is replaced with the discovery session's validated canonical JSON. |
+| `candidates.json`, `verifications.json`, `sessions.json` | Structured decisions, canonical phase JSON, and bounded accepted/rejected tool submissions with errors and explicit diagnostic truncation. |
 | `coverage.json`, `tool-trace.json`, `timing.json`, `usage.json`, `cleanup.json` | Unfinished work, tool reads and pending pages, phase timing, settled or unknown token usage, and host shutdown. |
 
 The 300-second budget covers preparation, worker initialization, both sessions, cleanup, and reporting. Git commands share the remaining deadline; the parent interrupts the worker before its deadline and kills its process group if needed. Credential files and the worker's temporary HOME are removed when it exits.

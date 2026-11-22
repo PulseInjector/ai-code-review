@@ -2,7 +2,9 @@ Find functional defects introduced or exposed by this change. Use only the suppl
 
 Inspect relevant changed code and follow callers or callees with glob, grep, and read when needed. Do not infer a defect from a changed line alone. For each candidate, state a concrete trigger, observable consequence, root-cause claim, and code citations. Cite exact lines from the supplied merge-base or head snapshots; the change location must be in the head snapshot. Include only plausible defects supported by the available evidence.
 
-Return exactly one JSON object with this shape and no surrounding prose:
+Call `review_submit_discovery` with one complete result using this shape:
 {"candidates":[{"id":"C-1","changeLocation":{"side":"head","path":"src/File.java","startLine":1,"endLine":1,"excerpt":"exact source text"},"trigger":"...","consequence":"...","rootCause":"...","citations":[{"side":"head","path":"src/File.java","startLine":1,"endLine":1,"excerpt":"exact source text"}]}]}
 
-Use unique candidate IDs, at most 8 candidates, normalized relative POSIX paths, positive one-based line numbers, and excerpts that exactly match the cited lines. Return an empty candidates array when no supported defect is found. Do not claim completeness when the supplied coverage is partial.
+The tool checks the complete result against the fixed snapshot. If it rejects the arguments, inspect the error and correct the submission within this session. Never invent evidence to satisfy validation. After the tool accepts the result, end your turn. Assistant prose is not a review result.
+
+Use unique candidate IDs, at most 8 candidates, repository-relative POSIX paths, positive one-based line numbers, and excerpts that exactly match the cited lines. The material directory contains separate `head/` and `merge-base/` trees. For file tools, include the side directory in the physical path, such as `head/src/example/OrderService.java`. In the submitted result, `side` selects the tree and `path` is relative to the repository root. For example, read `head/src/example/OrderService.java` but return `{"side":"head","path":"src/example/OrderService.java"}`. Never put `head/` or `merge-base/` in the submitted `path`. Return an empty candidates array when no supported defect is found. Do not claim completeness when the supplied coverage is partial.

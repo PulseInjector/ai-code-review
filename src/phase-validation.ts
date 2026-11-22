@@ -33,6 +33,10 @@ function materialReader(validation: PhaseValidation, materialDirectory: string):
 export async function validateDiscoveryText(text: string, validation: PhaseValidation, materialDirectory: string): Promise<Candidate[]> {
   let raw: unknown
   try { raw = JSON.parse(text) } catch { throw new Error("discovery output is not valid JSON") }
+  return validateDiscoveryValue(raw, validation, materialDirectory)
+}
+
+export async function validateDiscoveryValue(raw: unknown, validation: PhaseValidation, materialDirectory: string): Promise<Candidate[]> {
   const candidates = parseDiscoveryOutput(raw).candidates
   for (const candidate of candidates) {
     if (!validation.changedHeadPaths.includes(candidate.changeLocation.path)) {
@@ -46,6 +50,10 @@ export async function validateDiscoveryText(text: string, validation: PhaseValid
 export async function validateVerificationText(text: string, candidates: Candidate[], validation: PhaseValidation, materialDirectory: string): Promise<Verification[]> {
   let raw: unknown
   try { raw = JSON.parse(text) } catch { throw new Error("verification output is not valid JSON") }
+  return validateVerificationValue(raw, candidates, validation, materialDirectory)
+}
+
+export async function validateVerificationValue(raw: unknown, candidates: Candidate[], validation: PhaseValidation, materialDirectory: string): Promise<Verification[]> {
   const verifications = parseVerificationOutput(raw).verifications
   const expected = new Set(candidates.map(({ id }) => id))
   const actual = new Set(verifications.map(({ candidateId }) => candidateId))

@@ -199,6 +199,22 @@ These are three call sites, not three public protocols. `runPrReview` and `publi
 
 The dominant read paths are identity to captured PR, result to citations, and marker to comment. Each has one structure. There is no historical issue store or mutable run index. A comment stores one previous usable report and the latest publication metadata. Artifacts store full records per execution.
 
+### Structured model results
+
+The inherited runtime parsed the last assistant message as JSON. Live acceptance with `gpt-6.1-terra` reproduced an extra closing `]}` despite explicit prompt instructions. The fixed `@opencode/sdk@2.2.7` prompt input has no `format` field. Its supported plugin tool API accepts schema-declared arguments and persists tool outcomes in the session transcript.
+
+Discovery submits `review_submit_discovery` and verification submits `review_submit_verification`. Their input schemas derive from the existing domain schemas. Each session permits only its own result tool alongside read, grep, and glob. A session binding supplies immutable phase context, the original deadline, cancellation signal, and validated discovery candidates for verification. The result plugin checks schema and evidence through `phase-validation.ts` before returning an acceptance marker. It writes no files and sends no provider requests. Closing the phase releases its binding.
+
+Invalid tool arguments or citations produce tool errors. The model may correct its submission within the same SDK tool loop, existing 12-step limit, read budget, and phase deadline. This is explicit tool feedback, not a new prompt, transport retry, JSON repair, inferred excerpt, or path rewrite. A run with no accepted result still fails. Every model request remains in the existing request ledger. A valid submission can require one final acknowledgement request, which consumes the same budget.
+
+After the original prompt reaches successful durable idle, the runtime selects accepted calls only from that prompt-to-idle interval. It rejects wrong-phase submissions and conflicting accepted payloads. Repeated identical accepted payloads are idempotent. Refusal, interruption, truncation, provider failure, and expired deadlines cannot become success merely because a tool ran. Final prose never supplies review results. The standalone model connectivity smoke remains a text request. Canonical JSON continues through worker and parent evidence validation before publication.
+
+Every citation keeps separate `side` and repository-relative `path` fields. File tools use the physical `<materialDirectory>/<side>/<path>`. Full excerpts and valid multiline ranges remain supported. Exact candidate-set, included-file, changed-head, range, and excerpt checks remain authoritative. Tool input schemas guide generation but do not claim provider-enforced strict JSON Schema support.
+
+The SDK transcript owns submissions. The plugin stores phase authorization only, with no second answer store. `sessions.json` retains bounded submission records and validation errors, including rejected attempts before a corrected result. Diagnostic truncation is explicit and cannot create an accepted payload. A crash before a complete checkpoint preserves the existing failure semantics. The parent never trusts a tool acceptance marker across the worker boundary.
+
+The selected design uses durable transcript ownership and shared validation. A callback-owned result registry was rejected because it duplicates durable state. A provider response-format adapter or SDK upgrade would broaden the transport contract without a demonstrated need. Host-generated excerpts would change the evidence contract. Deterministic actual-SDK tests cover malformed assistant text, malformed tool arguments, invalid and corrected citations, phase isolation, duplicate/conflicting submissions, and terminal failures. Live acceptance separately requires exactly one verified defect, zero guarded findings, and partial incomplete coverage within the existing budgets.
+
 The existing local entry receives one extended options type. If the caller supplies `budget`, that budget owns the deadline and `timeoutMs` is rejected. Otherwise `runReview` constructs its existing local timeout. The parent starts the shared budget before capture and never resets it at this call.
 
 ```ts
