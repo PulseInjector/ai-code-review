@@ -21,8 +21,18 @@ const reviewSummary = z.object({ outcome: z.discriminatedUnion("kind", [
 ]) })
 const publishSummary = z.object({ publication: z.object({ kind: z.enum(["published", "retained", "rejected", "failed"]) }), commentId: z.string().nullable() })
 
+function parseInput<T extends z.ZodType>(name: string, schema: T, value: unknown): z.output<T> {
+  const parsed = schema.safeParse(value)
+  if (!parsed.success) {
+    throw new z.ZodError(parsed.error.issues.map((issue) => ({ ...issue, path: [name, ...issue.path] })))
+  }
+  return parsed.data
+}
+
 function failureMessage(error: unknown, env: NodeJS.ProcessEnv): string {
-  let message = error instanceof Error ? error.stack ?? error.message : "the Action command failed"
+  let message = error instanceof z.ZodError
+    ? JSON.stringify(error.issues)
+    : error instanceof Error ? error.stack ?? error.message : "the Action command failed"
   const credentials = [env.GITHUB_TOKEN, ...(env.REVIEW_ACTION_MODE === "review" ? [env.REVIEW_MODEL_API_KEY] : [])]
     .filter((value): value is string => value !== undefined && value !== "")
     .sort((left, right) => right.length - left.length)
@@ -54,15 +64,15 @@ export async function runAction(env: NodeJS.ProcessEnv = process.env, deps: Acti
   let stage: "input" | "initialization" = "input"
   try {
     if (mode !== "review" && mode !== "publish") throw new Error("Action mode must be review or publish")
-    const runId = runIdSchema.parse(env.GITHUB_RUN_ID)
-    const attemptText = z.string().regex(/^[1-9][0-9]*$/u).parse(env.GITHUB_RUN_ATTEMPT)
-    const attempt = attemptSchema.parse(Number(attemptText))
-    const runnerTemp = absolutePath.parse(env.RUNNER_TEMP)
-    const directory = absolutePath.parse(env.GITHUB_ACTION_PATH)
-    const repository = repositoryNameSchema.parse(env.GITHUB_REPOSITORY)
-    const pr = canonicalPrInputSchema.parse(env.REVIEW_ACTION_PR)
-    const config = relativePathSchema.parse(env.REVIEW_ACTION_CONFIG ?? "review.config.json")
-    const outputFile = absolutePath.parse(env.GITHUB_OUTPUT)
+    const runId = parseInput("GITHUB_RUN_ID", runIdSchema, env.GITHUB_RUN_ID)
+    const attemptText = parseInput("GITHUB_RUN_ATTEMPT", z.string().regex(/^[1-9][0-9]*$/u), env.GITHUB_RUN_ATTEMPT)
+    const attempt = parseInput("GITHUB_RUN_ATTEMPT", attemptSchema, Number(attemptText))
+    const runnerTemp = parseInput("RUNNER_TEMP", absolutePath, env.RUNNER_TEMP)
+    const directory = parseInput("GITHUB_ACTION_PATH", absolutePath, env.GITHUB_ACTION_PATH)
+    const repository = parseInput("GITHUB_REPOSITORY", repositoryNameSchema, env.GITHUB_REPOSITORY)
+    const pr = parseInput("REVIEW_ACTION_PR", canonicalPrInputSchema, env.REVIEW_ACTION_PR)
+    const config = parseInput("REVIEW_ACTION_CONFIG", relativePathSchema, env.REVIEW_ACTION_CONFIG ?? "review.config.json")
+    const outputFile = parseInput("GITHUB_OUTPUT", absolutePath, env.GITHUB_OUTPUT)
     const out = join(runnerTemp, `ai-code-review-${runId}-${attempt}`)
     const outputs = {
       status: "failed",
@@ -83,8 +93,8 @@ export async function runAction(env: NodeJS.ProcessEnv = process.env, deps: Acti
     const argv = [process.execPath, "--no-env-file", "run", join(directory, "src/cli.ts")]
     if (mode === "review") argv.push("review", "--repository", repository, "--pr", String(pr), "--config", config, "--out", out)
     else {
-      z.enum(["success", "failure", "cancelled", "skipped"]).parse(env.REVIEW_DOWNLOAD_OUTCOME)
-      const jobResult = jobResultSchema.parse(env.REVIEW_JOB_RESULT)
+      parseInput("REVIEW_DOWNLOAD_OUTCOME", z.enum(["success", "failure", "cancelled", "skipped"]), env.REVIEW_DOWNLOAD_OUTCOME)
+      const jobResult = parseInput("REVIEW_JOB_RESULT", jobResultSchema, env.REVIEW_JOB_RESULT)
       argv.push("publish", "--repository", repository, "--pr", String(pr), "--package", join(runnerTemp, "ai-code-review-download"), "--review-job-result", jobResult)
     }
     stage = "initialization"

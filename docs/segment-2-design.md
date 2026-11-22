@@ -1103,6 +1103,10 @@ The implementation keeps each invariant at one authoritative owner. Tests exerci
 
 There is no persistent lock file and no multi-file mutable comment state. The workflow provides serialization, and each comment PATCH replaces visible text and encoded state together. The publisher writes `publish-result.json` locally after every terminal path, with the precheck tuple, intended body digest, observed comment ID, postcheck tuple, and any failure. An ambiguous create additionally records the intended body digest, the re-list attempt count, and whether the comment was found. That evidence directory contains no model secret and at most 1 MiB of sanitized JSON and intended body text. Its artifact upload uses `always() && !cancelled()` after the publish Action.
 
+### Action preflight diagnostics
+
+The Action entry parses environment values one at a time before it writes outputs or starts the product command. A raw Zod issue from a single-value parse has an empty path, so serializing the issue alone does not identify the rejected variable. The entry prefixes the known environment key to each issue path. The existing redaction and 2,000-byte cap still apply, and the diagnostic does not include the submitted value. A deterministic Action-entry test supplies a malformed pull request input and verifies the field name, format reason, absence of the input value, and that no command starts. This test proves the diagnostic contract; a live acceptance dispatch is required to identify any production-only rejected runner value.
+
 ## 6. Security and trust boundaries
 
 The PR source is hostile data even though fork PRs are unsupported. A collaborator can add a malicious shell script, model instruction, `AGENTS.md`, plugin, symlink, secret-like file, or workflow. The integration does not execute those files. It fetches objects, parses bounded JSON from the base configuration, exports allowed regular text, and runs a fixed product program. Existing read-only permissions, context hooks, ancestor instruction checks, clean HOME, and no project config remain required together.

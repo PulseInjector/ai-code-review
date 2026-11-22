@@ -83,6 +83,16 @@ test("an entry preflight failure masks the key before its diagnostic", async () 
   expect(f.calls).toHaveLength(0)
 })
 
+test("an entry validation diagnostic names the rejected environment field without echoing its value", async () => {
+  const f = await fixture()
+  f.env.REVIEW_ACTION_PR = "017-sensitive"
+  expect(await runAction(f.env, { stderr: (s) => f.logs.push(s) })).toBe(1)
+  expect(f.logs[0]).toContain('"path":["REVIEW_ACTION_PR"]')
+  expect(f.logs[0]).toContain("must match pattern")
+  expect(f.logs[0]).not.toContain("017-sensitive")
+  expect(f.calls).toHaveLength(0)
+})
+
 test.each(["review", "publish"])("a %s execution failure reports its sanitized cause", async (mode) => {
   const f = await fixture(mode)
   f.env.GITHUB_TOKEN = "fake-github-token"
