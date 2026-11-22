@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { buildWorkerEnvironment, runIsolatedWorker } from "./worker-process"
 import type { RequestLedger, Submission } from "./contracts"
+import { resultToolResponse } from "./test-provider"
 
 type Scenario =
   | "kinds"
@@ -298,13 +299,17 @@ test("a discovery signal delivered during verification does not interrupt it", a
   await mkdir(material)
   const verificationStarted = Promise.withResolvers<void>()
   const verificationResponse = Promise.withResolvers<Response>()
+  const submitted = new Set<string>()
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const body = await request.text()
-    if (body.includes("Verification phase")) {
+    const phase = body.includes("Verification phase") ? "verify" : "discover"
+    if (submitted.has(phase)) return streamResponse("Done")
+    submitted.add(phase)
+    if (phase === "verify") {
       verificationStarted.resolve()
       return verificationResponse.promise
     }
-    return streamResponse('{"candidates":[]}')
+    return resultToolResponse("review_submit_discovery", '{"candidates":[]}')
   } })
   const pending = runIsolatedWorker({
     runDirectory: root, materialDirectory: material,
@@ -318,12 +323,12 @@ test("a discovery signal delivered during verification does not interrupt it", a
     const { pid } = JSON.parse(await readFile(join(root, "runtime/process.json"), "utf8"))
     process.kill(pid, "SIGUSR2")
     await Bun.sleep(50)
-    verificationResponse.resolve(streamResponse('{"verifications":[]}'))
+    verificationResponse.resolve(resultToolResponse("review_submit_verification", '{"verifications":[]}'))
     const result = await pending
     expect(result.status).toBe("complete")
     expect(result.sessions.map(({ name, status }) => [name, status])).toEqual([["discover", "complete"], ["verify", "complete"]])
   } finally {
-    verificationResponse.resolve(streamResponse('{"verifications":[]}'))
+    verificationResponse.resolve(resultToolResponse("review_submit_verification", '{"verifications":[]}'))
     await server.stop(true)
     await pending.catch(() => undefined)
     await rm(root, { recursive: true, force: true })

@@ -103,7 +103,19 @@ export const readBudgetSchema = z.strictObject({
   consumedBytes: z.int().nonnegative(), truncated: z.boolean(), exhausted: z.boolean(),
   records: z.array(readRecordSchema),
 })
-const phaseCommon = { name: z.string(), sessionID: z.string().optional(), usage: usageSchema, durationMs: z.int().nonnegative().optional() }
+export const outputSubmissionTraceSchema = z.strictObject({
+  records: z.array(z.strictObject({
+    callID: z.string().max(256), tool: z.string().max(256),
+    status: z.enum(["accepted", "rejected", "incomplete"]),
+    rawText: z.string().max(8 * 1024), error: z.string().max(2_000).optional(), truncated: z.boolean(),
+  })).max(24),
+  omitted: z.int().nonnegative(),
+})
+export type OutputSubmissionTrace = z.infer<typeof outputSubmissionTraceSchema>
+const phaseCommon = {
+  name: z.string(), sessionID: z.string().optional(), usage: usageSchema, durationMs: z.int().nonnegative().optional(),
+  outputSubmissions: outputSubmissionTraceSchema.optional(),
+}
 export const phaseResultSchema = z.discriminatedUnion("status", [
   z.strictObject({ ...phaseCommon, status: z.literal("complete"), text: z.string().min(1).max(256 * 1024) }),
   // The typed code is the authoritative terminal classification. The parent never pattern-matches
@@ -113,6 +125,7 @@ export const phaseResultSchema = z.discriminatedUnion("status", [
     status: z.enum(["failed", "interrupted", "timeout", "read-budget-exhausted"]),
     error: z.string().min(1),
     code: failureCodeSchema,
+    rawText: z.string().max(256 * 1024).optional(),
   }),
 ])
 const runCommon = {

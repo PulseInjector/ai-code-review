@@ -6,6 +6,8 @@ import { z } from "zod"
 import { runIsolatedWorker } from "./worker-process"
 import { deadlineClock } from "../budget"
 import { runtimeFailure, workerProgressSchema, type RuntimeResult } from "./contracts"
+import type { CodeReference } from "../contracts"
+import { resultToolResponse } from "./test-provider"
 
 function modelResponse(text: string) {
   const chunk = (delta: { content?: string }, finishReason: string | null) => `data: ${JSON.stringify({
@@ -18,6 +20,118 @@ function modelResponse(text: string) {
 }
 
 const workerPath = join(import.meta.dir, "worker.ts")
+
+for (const scenario of ["malformed", "excerpt", "path", "conflict", "duplicate", "wrong-phase", "prose-only", "truncated", "required-choice", "step-cap"] as const) {
+  test(`structured review submission handles ${scenario} without weakening evidence validation`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-submission-case-"))
+    const material = join(root, "material")
+    const reference = { side: "head", path: "change.txt", startLine: 1, endLine: 1, excerpt: "change" } satisfies CodeReference
+    const valid = { candidates: [{ id: "C-1", changeLocation: reference, trigger: "trigger", consequence: "consequence", rootCause: "cause", citations: [reference] }] }
+    const json = JSON.stringify(valid)
+    const requests: string[] = []
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      requests.push(await request.text())
+      const index = requests.length
+      const choice = z.object({ tool_choice: z.string().optional() }).parse(JSON.parse(requests.at(-1)!)).tool_choice
+      if (scenario === "required-choice" && choice !== "required") return modelResponse("Done")
+      if (scenario === "step-cap") return choice === "none" ? modelResponse("Step limit reached") : resultToolResponse("read", JSON.stringify({ path: "head/change.txt" }))
+      if (scenario === "prose-only") return modelResponse(json)
+      if (scenario === "wrong-phase" && index === 1) return resultToolResponse("review_submit_verification", '{"verifications":[]}')
+      if (scenario === "malformed" && index === 1) return resultToolResponse("review_submit_discovery", json + "]}")
+      if ((scenario === "excerpt" || scenario === "path") && index === 1) {
+        const bad = { ...reference, ...(scenario === "excerpt" ? { excerpt: "invented" } : { path: "head/change.txt" }) }
+        return resultToolResponse("review_submit_discovery", JSON.stringify({ candidates: [{ ...valid.candidates[0], citations: [bad] }] }))
+      }
+      if (scenario === "truncated" && index === 2) {
+        const response = modelResponse("Incomplete acknowledgement")
+        return new Response((await response.text()).replace('"finish_reason":"stop"', '"finish_reason":"length"'), { headers: response.headers })
+      }
+      if (index === 1 || (index === 2 && ["malformed", "excerpt", "path", "duplicate", "conflict"].includes(scenario))) {
+        return resultToolResponse("review_submit_discovery", scenario === "conflict" && index === 2 ? '{"candidates":[]}' : json)
+      }
+      return modelResponse("Done. ]}")
+    } })
+    try {
+      await mkdir(join(material, "head"), { recursive: true })
+      await writeFile(join(material, "head/change.txt"), "change\n")
+      const result = await runIsolatedWorker({
+        runDirectory: root, materialDirectory: material, apiKey: "submission-test-key",
+        model: { providerID: "test", modelID: "test-model", baseURL: `http://127.0.0.1:${server.port}/v1` },
+        phaseValidation: { changedHeadPaths: [reference.path], includedFiles: [{ side: reference.side, path: reference.path }] },
+        prompts: [{ name: "discover", text: "Discover the change through the result tool." }],
+      })
+      const phase = result.sessions[0]
+      if (["conflict", "wrong-phase", "prose-only", "truncated", "step-cap"].includes(scenario)) {
+        expect(result.status).toBe("failed")
+        expect(phase?.status).toBe("failed")
+        expect(phase).not.toHaveProperty("text")
+      } else {
+        expect(result.status).toBe("complete")
+        if (phase?.status !== "complete") throw new Error("expected complete discovery")
+        expect(JSON.parse(phase.text)).toEqual(valid)
+        expect(phase.outputSubmissions?.records.map((record) => record.status)).toEqual(scenario === "duplicate" ? ["accepted", "accepted"] : scenario === "required-choice" ? ["accepted"] : ["rejected", "accepted"])
+        expect(requests[1]).toContain(scenario === "malformed" ? "could not be parsed as JSON" : scenario === "excerpt" ? "excerpt does not match" : scenario === "path" ? "not present in the prepared" : "accepted")
+        expect(z.object({ tool_choice: z.string() }).parse(JSON.parse(requests.at(-1)!)).tool_choice).toBe("none")
+      }
+      expect(result.requests.records).toHaveLength(requests.length)
+      expect(result.requests.records.every((record) => record.status === 200 && record.outcome === "response")).toBe(true)
+      expect(z.object({ tool_choice: z.string() }).parse(JSON.parse(requests[0]!)).tool_choice).toBe("required")
+      if (scenario === "step-cap") {
+        expect(requests).toHaveLength(12)
+        expect(z.object({ tool_choice: z.string() }).parse(JSON.parse(requests.at(-1)!)).tool_choice).toBe("none")
+      }
+      expect(result.cleanup).toEqual({ hostClosed: true, forced: false })
+    } finally {
+      await server.stop(true)
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+}
+
+test("review phases consume schema tool arguments instead of malformed assistant prose", async () => {
+  const root = await mkdtemp(join(tmpdir(), "review-structured-output-"))
+  const material = join(root, "material")
+  const calls = { discover: 0, verify: 0 }
+  const toolNames: string[] = []
+  const requestSchema = z.looseObject({ tools: z.array(z.looseObject({
+    function: z.looseObject({ name: z.string(), parameters: z.looseObject({ properties: z.record(z.string(), z.unknown()).optional() }) }),
+  })).optional() })
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const raw = await request.text()
+    const phase = raw.includes("Verify structured result") ? "verify" : "discover"
+    const property = phase === "discover" ? "candidates" : "verifications"
+    const body = requestSchema.parse(JSON.parse(raw))
+    const tool = body.tools?.find((tool) => property in (tool.function.parameters.properties ?? {}))
+    calls[phase]++
+    if (!tool || calls[phase] > 1) return modelResponse(`{"${property}":[]}]} `)
+    toolNames.push(tool.function.name)
+    const chunk = (delta: unknown, finish: string | null) => `data: ${JSON.stringify({
+      id: "structured-result", object: "chat.completion.chunk", created: 0, model: "test-model",
+      choices: [{ index: 0, delta, finish_reason: finish }],
+    })}\n\n`
+    return new Response(chunk({ tool_calls: [{ index: 0, id: `submit-${phase}`, type: "function", function: {
+      name: tool.function.name, arguments: JSON.stringify({ [property]: [] }),
+    } }] }, null) + chunk({}, "tool_calls") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+  } })
+  try {
+    await mkdir(material)
+    const result = await runIsolatedWorker({
+      runDirectory: root, materialDirectory: material, apiKey: "structured-test-key",
+      model: { providerID: "test", modelID: "test-model", baseURL: `http://127.0.0.1:${server.port}/v1` },
+      phaseValidation: { changedHeadPaths: [], includedFiles: [] },
+      prompts: [{ name: "discover", text: "Discover structured result" }, { name: "verify", text: "Verify structured result" }],
+    })
+    expect(result).toMatchObject({ status: "complete", cleanup: { hostClosed: true, forced: false }, sessions: [
+      { name: "discover", status: "complete", text: '{"candidates":[]}' },
+      { name: "verify", status: "complete", text: '{"verifications":[]}' },
+    ] })
+    expect(toolNames).toHaveLength(2)
+    expect(result.requests.records.every((request) => request.kind === "primary")).toBe(true)
+  } finally {
+    await server.stop(true)
+    await rm(root, { recursive: true, force: true })
+  }
+}, 20_000)
 
 test("a stalled model worker exits within the parent deadline and retains unknown usage", async () => {
   const root = await mkdtemp(join(tmpdir(), "review-timeout-"))
@@ -114,7 +228,7 @@ test("an SDK discovery response completed after its deadline never starts verifi
     const verifying = body.includes("Verification phase")
     requests.push(verifying ? "verify" : "discover")
     if (!verifying) await writeFile(jump, "")
-    return modelResponse(verifying ? '{"verifications":[]}' : '{"candidates":[]}')
+    return resultToolResponse(verifying ? "review_submit_verification" : "review_submit_discovery", verifying ? '{"verifications":[]}' : '{"candidates":[]}')
   } })
   try {
     await mkdir(material)
@@ -167,15 +281,19 @@ for (const [phase, late] of [["discover", true], ["verify", true], ["verify", fa
         // real citation validation opens its reader.
         expect(Bun.spawnSync(["mkfifo", evidencePath]).exitCode).toBe(0)
         writers.push(Bun.spawn([process.execPath, "-e", `
-import { closeSync, existsSync, openSync, writeFileSync, writeSync } from "node:fs"
+import { closeSync, existsSync, openSync, unlinkSync, writeFileSync, writeSync } from "node:fs"
 const fd = openSync(${JSON.stringify(evidencePath)}, "w")
 writeFileSync(${JSON.stringify(ready)}, "")
 while (!existsSync(${JSON.stringify(release)})) await Bun.sleep(10)
 writeSync(fd, "evidence\\n")
+unlinkSync(${JSON.stringify(evidencePath)})
+writeFileSync(${JSON.stringify(evidencePath)}, "evidence\\n")
 closeSync(fd)
 `], { stdout: "ignore", stderr: "ignore" }))
       }
-      return modelResponse(verifying ? verification : discovery)
+      return requests.filter((name) => name === active).length === 1
+        ? resultToolResponse(verifying ? "review_submit_verification" : "review_submit_discovery", verifying ? verification : discovery)
+        : modelResponse("Done")
     } })
     let pending: Promise<RuntimeResult> | undefined
     try {
@@ -212,9 +330,12 @@ await import(${JSON.stringify(workerPath)})
         expect(unsettled).not.toHaveProperty("text")
       } else {
         expect(result).toMatchObject({ status: "complete", cleanup: { hostClosed: true, forced: false } })
-        expect(result.sessions.at(-1)).toMatchObject({ name: "verify", status: "complete", text: verification })
+        const verified = result.sessions.at(-1)
+        expect(verified).toMatchObject({ name: "verify", status: "complete" })
+        if (verified?.status !== "complete") throw new Error("expected completed verification")
+        expect(JSON.parse(verified.text)).toEqual(JSON.parse(verification))
       }
-      expect(requests).toEqual(phase === "discover" ? ["discover"] : ["discover", "verify"])
+      expect(requests).toEqual(phase === "discover" ? ["discover"] : late ? ["discover", "discover", "verify"] : ["discover", "discover", "verify", "verify"])
     } finally {
       for (const writer of writers) writer.kill("SIGKILL")
       await Promise.all(writers.map(({ exited }) => exited))
@@ -224,6 +345,55 @@ await import(${JSON.stringify(workerPath)})
     }
   }, 15_000)
 }
+
+test("a rejected model citation keeps its bounded raw phase output for replay", async () => {
+  const root = await mkdtemp(join(tmpdir(), "review-invalid-citation-output-"))
+  const material = join(root, "material")
+  const changed = { side: "head", path: "change.txt", startLine: 1, endLine: 1, excerpt: "change" } satisfies CodeReference
+  const baseline = { ...changed, side: "merge-base", excerpt: "before" } satisfies CodeReference
+  const discovery = JSON.stringify({ candidates: [{
+    id: "C-1", changeLocation: changed, trigger: "trigger", consequence: "consequence", rootCause: "cause", citations: [changed],
+  }] })
+  const rejected = JSON.stringify({ verifications: [{
+    candidateId: "C-1", decision: "keep", reason: "The caller iterates the result.",
+    evidence: [{ ...changed, path: "head/change.txt" }],
+  }] })
+  const submitted = new Set<string>()
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const prompt = await request.text()
+    const phase = prompt.includes("Verify this candidate") ? "verify" : "discover"
+    if (submitted.has(phase)) return modelResponse("Done")
+    submitted.add(phase)
+    return resultToolResponse(phase === "verify" ? "review_submit_verification" : "review_submit_discovery", phase === "verify" ? rejected : discovery)
+  } })
+  try {
+    await mkdir(join(material, "head"), { recursive: true })
+    await mkdir(join(material, "merge-base"), { recursive: true })
+    await writeFile(join(material, "head/change.txt"), "change\n")
+    await writeFile(join(material, "merge-base/change.txt"), "before\n")
+    const started = Date.now()
+    const result = await runIsolatedWorker({
+      runDirectory: root, materialDirectory: material, apiKey: "invalid-citation-test-key",
+      model: { providerID: "test", modelID: "test-model", baseURL: `http://127.0.0.1:${server.port}/v1` },
+      phaseDeadlines: {
+        prepareInitEpochMs: started + 5_000, discoveryEpochMs: null, analysisStopEpochMs: started + 20_000,
+        workerKillEpochMs: started + 25_000, finalEpochMs: started + 26_000,
+      },
+      phaseValidation: { changedHeadPaths: [changed.path], includedFiles: [changed, baseline].map(({ side, path }) => ({ side, path })) },
+      prompts: [{ name: "discover", text: "Discover this change." }, { name: "verify", text: "Verify this candidate." }],
+    }, { workerPath, clock: deadlineClock })
+    expect(result).toMatchObject({ status: "failed", code: "citation-invalid", sessions: [
+      { name: "discover", status: "complete" }, { name: "verify", status: "failed", rawText: rejected },
+    ] })
+    const saved = z.object({ sessions: z.array(z.object({ rawText: z.string().optional() })) })
+      .parse(JSON.parse(await readFile(join(root, "runtime/result.json"), "utf8")))
+    expect(saved.sessions[1]?.rawText).toBe(rejected)
+    expect(JSON.stringify(saved)).not.toContain("invalid-citation-test-key")
+  } finally {
+    await server.stop(true)
+    await rm(root, { recursive: true, force: true })
+  }
+}, 15_000)
 
 // The installed SDK runs its model server in-process, so a stalled worker spawns no descendant of
 // its own. The group-kill guarantee the parent relies on still has to cover any descendant a

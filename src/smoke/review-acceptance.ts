@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createJavaReviewRepository } from "../fixtures/java-review"
-import { reviewResultSchema } from "../contracts"
+import { reviewResultSchema, verificationOutputSchema } from "../contracts"
 import { runtimeResultSchema } from "../runtime/contracts"
 import { z } from "zod"
 
@@ -17,7 +17,7 @@ function git(args: string[]) {
   return decoder.decode(result.stdout).trim()
 }
 
-async function review(name: string, base: string, head: string, options: { allowFailed?: boolean } = {}) {
+async function review(name: string, base: string, head: string) {
   const out = join(root, name)
   const started = Date.now()
   const child = Bun.spawnSync(["bun", "run", "review", "--", "--repo", repo, "--base", base, "--head", head, "--out", out], {
@@ -30,7 +30,7 @@ async function review(name: string, base: string, head: string, options: { allow
   try { raw = JSON.parse(stdout) } catch { throw new Error(`${name} returned no result JSON: ${stderr || stdout}`) }
   const result = z.object({ runDirectory: z.string(), result: reviewResultSchema }).parse(raw)
   const report = await readFile(join(out, "report.md"), "utf8")
-  if (result.result.status === "failed" && !options.allowFailed) {
+  if (result.result.status === "failed") {
     throw new Error(`${name} failed: ${result.result.stageErrors[0]?.message ?? stderr}`)
   }
   assert.ok(Date.now() - started < 300_000, "review exceeded its whole-run budget")
@@ -60,12 +60,17 @@ try {
   const commits = await createJavaReviewRepository(repo)
   const defect = await review("defect", commits.baseSha, commits.defectSha)
   assert.equal(defect.code, 0)
-  assert.ok(defect.result.issues.length > 0)
+  assert.equal(defect.result.status, "complete")
+  assert.equal(defect.result.issues.length, 1)
   assert.ok(defect.report.includes("OrderService.java"))
 
   const guarded = await review("guarded", commits.baseSha, commits.guardedSha)
   assert.equal(guarded.code, 0)
   assert.deepEqual(guarded.result.issues, [])
+  const guardedVerification = verificationOutputSchema.parse({
+    verifications: JSON.parse(await readFile(join(guarded.out, "verifications.json"), "utf8")),
+  })
+  assert.ok(guardedVerification.verifications.every(({ decision }) => decision === "reject"), "guarded candidates must be disproved, not unknown")
 
   git(["switch", "--quiet", "--detach", commits.baseSha])
   const caller = join(repo, "src/example/OrderSummary.java")
@@ -75,26 +80,14 @@ try {
   git(["-c", "user.name=Review Acceptance", "-c", "user.email=acceptance@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "test oversized supporting caller"])
   const incompleteBase = git(["rev-parse", "HEAD"])
   git(["-c", "user.name=Review Acceptance", "-c", "user.email=acceptance@example.invalid", "-c", "commit.gpgsign=false", "cherry-pick", commits.defectSha])
-  const incomplete = await review("incomplete", incompleteBase, git(["rev-parse", "HEAD"]), { allowFailed: true })
+  const incomplete = await review("incomplete", incompleteBase, git(["rev-parse", "HEAD"]))
   const omittedCaller = "src/example/OrderSummary.java"
-  assert.ok(["partial", "failed"].includes(incomplete.result.status))
+  assert.equal(incomplete.result.status, "partial")
   assert.ok(incomplete.result.coverage.omittedPaths.includes(omittedCaller))
   assert.ok(incomplete.report.includes(omittedCaller), "report must name the omitted supporting file")
-  if (incomplete.result.status === "partial") {
-    assert.equal(incomplete.code, 0)
-    assert.equal(incomplete.result.stageErrors.length, 0)
-    assert.ok(incomplete.report.includes("Status: **partial**"), "report must not present partial coverage as complete")
-  } else {
-    assert.equal(incomplete.code, 1)
-    assert.equal(incomplete.result.issues.length, 0, "failed review must not publish findings")
-    assert.ok(incomplete.result.stageErrors.length > 0, "failed review must explain the failure")
-    for (const error of incomplete.result.stageErrors) {
-      assert.ok(incomplete.report.includes(error.message), "report must include each failure reason")
-    }
-    assert.ok(incomplete.report.includes("Status: **failed**"), "report must identify the failed review")
-    assert.equal(incomplete.runtime.cleanup.hostClosed, true, "failed review worker host must be closed")
-    assert.equal(incomplete.runtime.cleanup.forced, false, "failed review worker must not require forced shutdown")
-  }
+  assert.equal(incomplete.code, 0)
+  assert.equal(incomplete.result.stageErrors.length, 0)
+  assert.ok(incomplete.report.includes("Status: **partial**"), "report must not present partial coverage as complete")
 
   const summary = {
     defect: { status: defect.result.status, findings: defect.result.issues.length, report: join(defect.out, "report.md") },

@@ -87,7 +87,7 @@ async function verify(mode: Extract<Mode, { kind: "local" | "live" }>): Promise<
   const commands: { name: string; argv: string[]; exitCode: number; durationMs: number; stdout: string; stderr: string }[] = []
   const drive: Drive = async (name, argv, overrides) => {
     const started = Date.now()
-    const result = await execute(argv, { ...env, ...overrides }, live ? 1_000_000 : 120_000)
+    const result = await execute(argv, { ...env, ...overrides }, live ? 1_000_000 : name === "tests" ? 180_000 : 120_000)
       .catch((error: unknown) => ({ exitCode: 1, stdout: "", stderr: String(error) }))
     const stdout = `${name}.stdout.txt`
     const stderr = `${name}.stderr.txt`
