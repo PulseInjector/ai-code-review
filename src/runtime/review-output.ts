@@ -1,4 +1,5 @@
 import { Plugin } from "@opencode/plugin"
+import { z } from "zod"
 import type { SessionMessageInfo } from "@opencode/client"
 import { discoveryOutputSchema, verificationOutputSchema, type Candidate } from "../contracts"
 import { validateDiscoveryValue, validateVerificationValue } from "../phase-validation"
@@ -18,7 +19,7 @@ export function reviewOutputTool(name: string): string | undefined {
 }
 
 export function createReviewOutput(options: { validation: PhaseValidation; materialDirectory: string }) {
-  const bindings = new Map<string, Binding>()
+  const bindings = new Map<string, Binding & { submitted: boolean }>()
   const plugin = Plugin.define({
     id: "review.structured-output",
     async setup(ctx) {
@@ -47,18 +48,35 @@ export function createReviewOutput(options: { validation: PhaseValidation; mater
                 await validateVerificationValue(input, binding.phase.candidates, options.validation, options.materialDirectory)
               }
               checkActive()
+              binding.submitted = true
               return { content: "Review result accepted. End your turn without another submission.", metadata: { reviewAccepted: true } }
             },
           })
         }
       })
-      return () => registration.dispose()
+      try {
+        const requestHook = await ctx.session.hook("http.request", async (event) => {
+          const binding = bindings.get(event.sessionID)
+          if (event.kind !== "primary" || !binding) return
+          const body = z.looseObject({ tools: z.array(z.unknown()).optional() }).parse(await event.request.clone().json())
+          if (!body.tools?.length) return
+          const headers = new Headers(event.request.headers)
+          headers.delete("content-length")
+          event.request = new Request(event.request, {
+            headers, body: JSON.stringify({ ...body, tool_choice: binding.submitted ? "none" : "required" }),
+          })
+        })
+        return async () => { await Promise.all([registration.dispose(), requestHook.dispose()]) }
+      } catch (error) {
+        await registration.dispose()
+        throw error
+      }
     },
   })
   return {
     plugin,
     bind(sessionID: string, binding: Binding): () => void {
-      bindings.set(sessionID, binding)
+      bindings.set(sessionID, { ...binding, submitted: false })
       return () => { bindings.delete(sessionID) }
     },
   }

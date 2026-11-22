@@ -274,7 +274,7 @@ async function runSession(options: {
         }
         if (output?.kind === "failed") {
           const error = boundedErrorText(output.error)
-          return { name: prompt.name, sessionID, status: "failed", error, code: validationFailureCode(error), usage, outputSubmissions, rawText: output.rawText }
+          return { name: prompt.name, sessionID, status: "failed", error, code: validationFailureCode(error), usage, outputSubmissions, rawText: output.rawText ?? text?.slice(0, 256 * 1024) }
         }
         if (!text || completed.assistants.some((assistant) => assistant.finish === "length" || assistant.finish === "error") || Buffer.byteLength(text) > 256 * 1024) {
           return { name: prompt.name, sessionID, status: "failed", error: "model returned no usable complete assistant text", code: "model-format", usage, outputSubmissions }
@@ -387,7 +387,7 @@ export async function runRuntime(
       models: { fetch: false }, fs: { filewatcher: false },
       plugins: [createContextLimitsPlugin({ limits: input.readLimits, budget, materialDirectory: input.materialDirectory,
         onChange: emitProgress, onExhausted: () => { stopped = "read-budget-exhausted"; controller.abort() } }),
-        policy.plugin, reviewOutput.plugin],
+        reviewOutput.plugin, policy.plugin],
     })
     void creating.then((created) => {
       if (abandonedCreate) created.close().catch(() => undefined)

@@ -253,7 +253,9 @@ the same review entry.
    `review_submit_verification`. The fixed v2.2.7 prompt API has no
    `json_schema` parameter. Tool schemas derive from the existing domain
    schemas, and the program checks exact source evidence before accepting a
-   submission. The model can correct rejected tool arguments within the same
+   submission. The OpenAI-compatible request hook requires tool use until
+   acceptance and disables further calls afterward. It preserves the SDK
+   step cap and runs before request-policy accounting. The model can correct rejected tool arguments within the same
    SDK loop and original budgets. No outer repair prompt or JSON repair is
    allowed. Final assistant prose never supplies review results. A refusal,
    incomplete turn, or absence of a valid submission remains a failure.

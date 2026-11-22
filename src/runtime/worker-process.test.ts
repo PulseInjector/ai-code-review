@@ -21,7 +21,7 @@ function modelResponse(text: string) {
 
 const workerPath = join(import.meta.dir, "worker.ts")
 
-for (const scenario of ["malformed", "excerpt", "path", "conflict", "duplicate", "wrong-phase", "prose-only", "truncated"] as const) {
+for (const scenario of ["malformed", "excerpt", "path", "conflict", "duplicate", "wrong-phase", "prose-only", "truncated", "required-choice"] as const) {
   test(`structured review submission handles ${scenario} without weakening evidence validation`, async () => {
     const root = await mkdtemp(join(tmpdir(), "review-submission-case-"))
     const material = join(root, "material")
@@ -32,6 +32,8 @@ for (const scenario of ["malformed", "excerpt", "path", "conflict", "duplicate",
     const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
       requests.push(await request.text())
       const index = requests.length
+      const choice = z.object({ tool_choice: z.string().optional() }).parse(JSON.parse(requests.at(-1)!)).tool_choice
+      if (scenario === "required-choice" && choice !== "required") return modelResponse("Done")
       if (scenario === "prose-only") return modelResponse(json)
       if (scenario === "wrong-phase" && index === 1) return resultToolResponse("review_submit_verification", '{"verifications":[]}')
       if (scenario === "malformed" && index === 1) return resultToolResponse("review_submit_discovery", json + "]}")
@@ -66,10 +68,13 @@ for (const scenario of ["malformed", "excerpt", "path", "conflict", "duplicate",
         expect(result.status).toBe("complete")
         if (phase?.status !== "complete") throw new Error("expected complete discovery")
         expect(JSON.parse(phase.text)).toEqual(valid)
-        expect(phase.outputSubmissions?.records.map((record) => record.status)).toEqual(scenario === "duplicate" ? ["accepted", "accepted"] : ["rejected", "accepted"])
+        expect(phase.outputSubmissions?.records.map((record) => record.status)).toEqual(scenario === "duplicate" ? ["accepted", "accepted"] : scenario === "required-choice" ? ["accepted"] : ["rejected", "accepted"])
         expect(requests[1]).toContain(scenario === "malformed" ? "could not be parsed as JSON" : scenario === "excerpt" ? "excerpt does not match" : scenario === "path" ? "not present in the prepared" : "accepted")
+        expect(z.object({ tool_choice: z.string() }).parse(JSON.parse(requests.at(-1)!)).tool_choice).toBe("none")
       }
       expect(result.requests.records).toHaveLength(requests.length)
+      expect(result.requests.records.every((record) => record.status === 200 && record.outcome === "response")).toBe(true)
+      expect(z.object({ tool_choice: z.string() }).parse(JSON.parse(requests[0]!)).tool_choice).toBe("required")
       expect(result.cleanup).toEqual({ hostClosed: true, forced: false })
     } finally {
       await server.stop(true)

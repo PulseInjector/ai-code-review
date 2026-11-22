@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createJavaReviewRepository } from "../fixtures/java-review"
-import { reviewResultSchema } from "../contracts"
+import { reviewResultSchema, verificationOutputSchema } from "../contracts"
 import { runtimeResultSchema } from "../runtime/contracts"
 import { z } from "zod"
 
@@ -66,8 +66,11 @@ try {
 
   const guarded = await review("guarded", commits.baseSha, commits.guardedSha)
   assert.equal(guarded.code, 0)
-  assert.equal(guarded.result.status, "complete")
   assert.deepEqual(guarded.result.issues, [])
+  const guardedVerification = verificationOutputSchema.parse({
+    verifications: JSON.parse(await readFile(join(guarded.out, "verifications.json"), "utf8")),
+  })
+  assert.ok(guardedVerification.verifications.every(({ decision }) => decision === "reject"), "guarded candidates must be disproved, not unknown")
 
   git(["switch", "--quiet", "--detach", commits.baseSha])
   const caller = join(repo, "src/example/OrderSummary.java")
