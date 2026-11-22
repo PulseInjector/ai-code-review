@@ -14,6 +14,11 @@ Write or update the segment design at `docs/segment-N-design.md` before implemen
 
 Review and approve the design before implementation. When behavior changes during implementation, update the design in the same branch and the same pull request. `PLAN.md` remains the authority for scope, order, and acceptance.
 
+The [verification tooling proposal](docs/verification-tooling-design.md)
+describes a scoped follow-up to Segment 2. Its checkpoints use this same
+design approval and integration-branch workflow. Until implemented, use the
+verification commands documented in `ENVIRONMENT.md`.
+
 ## Make and Check the Change
 
 Keep code, tests, and documentation consistent with the behavior changed. Run the checks relevant to the change. Record the commands that ran, their results, and any relevant command that did not run:

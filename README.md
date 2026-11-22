@@ -40,6 +40,9 @@ For the pull request command, the Action, and the model configuration, read
   and the GitHub Action contract.
 - [docs/segment-2-design.md](docs/segment-2-design.md): Segment 2 design
   record.
+- [docs/verification-tooling-design.md](docs/verification-tooling-design.md):
+  proposed tooling for evidence-backed diagnosis and focused development checks.
+  Its new commands are not implemented.
 
 This README is the initial entry point. Segment 5 completes the onboarding
 documentation. Current progress is in [PLAN.md](PLAN.md#current-state).

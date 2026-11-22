@@ -1156,7 +1156,14 @@ The request-policy tests drive the installed SDK against a scripted OpenAI-compa
 
 The fake clock advances to 59,999, 60,000, discovery start plus 119,999 and 120,000, 289,999, 290,000, 298,000, and 300,000 ms. At each boundary, tests assert whether a new request is permitted, which signal fires, what checkpoint survives, and which artifacts remain. A real-process test hangs the worker and one descendant, confirms process-group termination, and scans replay exports for the model-key and Git-token sentinel values. It reuses the existing worker-process test mechanisms.
 
-Commands for each checkpoint are recorded under the checkpoint sequence. The full end-to-end commands are `bun run typecheck`, `bun run test`, `bun run verify`, `bun run verify --area github`, `bun run smoke:sdk`, `bun run smoke:model`, and `bun run smoke:review`. The last two require a configured live endpoint and incur model calls. The GitHub live acceptance is a separate `bun run verify --live-github` mode with explicit repository and PR parameters validated by the verification CLI. It cannot publish arbitrary artifact state. It only invokes the same trusted workflow and reads its results.
+Commands for each checkpoint are recorded under the checkpoint sequence. The current local verification entry is `bun run verify`; it already includes type checking, the test suite, SDK lifecycle, Java, and local CLI journeys. `bun run verify --area github` adds the GitHub area and composite-equivalent context. `bun run verify --live` runs the model smoke and three-case acceptance with provider calls. Individual commands remain available for focused diagnosis; the list is not an instruction to repeat checks already covered by the same applicable evidence.
+
+The originally proposed `bun run verify --live-github` mode was not implemented.
+Live workflow evidence currently comes from direct dispatch and inspection.
+The [verification tooling companion design](verification-tooling-design.md)
+proposes named workflow checks and exact-run collection to replace that
+unimplemented command shape. The proposal cannot publish arbitrary artifact
+state and preserves the acceptance rows above. Its commands are not yet available.
 
 ## 8. Rationale
 

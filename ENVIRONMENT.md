@@ -35,6 +35,11 @@ bun run smoke:java
 
 ## Verification CLI
 
+This section documents the implemented commands. The
+[verification tooling design](docs/verification-tooling-design.md) proposes
+inspection, selection, replay, and workflow collection. Those proposed commands
+are not available yet.
+
 ```sh
 bun run verify doctor
 bun run verify
